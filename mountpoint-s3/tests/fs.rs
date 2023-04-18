@@ -445,3 +445,27 @@ async fn test_stat_block_size() {
     assert_eq!(lookup.attr.blocks, 9);
     assert_eq!(lookup.attr.blksize, 4096);
 }
+
+#[tokio::test]
+async fn test_ghost_file() {
+    let (client, fs) = make_test_filesystem("test_ghost_file", &Default::default(), Default::default());
+
+    let filename = "ghost";
+    client.add_object(filename, MockObject::constant(0xa1, 0, ETag::for_tests()));
+
+    // Ensure mountpoint "sees" the file
+    fs.lookup(FUSE_ROOT_INODE, filename.as_ref()).await.unwrap();
+
+    // Remove "remotely"
+    client.remove_object(filename);
+
+    fs.lookup(FUSE_ROOT_INODE, filename.as_ref())
+        .await
+        .expect_err("The file has gone...");
+
+    // ...or is it?
+    let result = fs
+        .mknod(FUSE_ROOT_INODE, filename.as_ref(), libc::S_IFREG | libc::S_IRWXU, 0, 0)
+        .await;
+    assert!(matches!(result, Err(libc::EEXIST)));
+}
