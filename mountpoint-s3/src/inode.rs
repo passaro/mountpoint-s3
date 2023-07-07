@@ -129,6 +129,23 @@ impl Superblock {
                 let new_lookup_count = inode.dec_lookup_count(n);
                 if new_lookup_count == 0 {
                     // Safe to remove, kernel no longer has a reference to it.
+                    if let Some(parent) = inodes.get(&inode.parent()) {
+                        trace!(ino, parent_ino = parent.ino(), "removing inode from parent");
+                        if let Ok(mut parent_state) = parent.get_mut_inode_state() {
+                            if let InodeKindData::Directory {
+                                children,
+                                writing_children,
+                                ..
+                            } = &mut parent_state.kind_data
+                            {
+                                if children.get(inode.name()).is_some_and(|&child_ino| child_ino == ino) {
+                                    // Only remove if ino matches.
+                                    children.remove(inode.name());
+                                }
+                                writing_children.remove(&ino);
+                            }
+                        }
+                    }
                     trace!(ino, "removing inode from superblock");
                     inodes.remove(&ino);
                 }
