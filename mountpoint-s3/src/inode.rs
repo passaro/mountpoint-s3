@@ -237,8 +237,8 @@ impl Superblock {
         let InodeKindData::Directory { children, .. } = &mut parent_state.kind_data else {
             return Err(InodeError::NotADirectory(dir));
         };
-        if let Some(inode) = children.get(name) {
-            return Err(InodeError::FileAlreadyExists(inode.ino()));
+        if let Some(&ino) = children.get(name) {
+            return Err(InodeError::FileAlreadyExists(ino));
         }
 
         // Local inode stats never expire, because they can't be looked up remotely
@@ -389,11 +389,11 @@ impl Superblock {
                 // We assume that the VFS will hold a lock on the parent and child.
                 // However, we don't hold this lock over remote calls as we don't want to move to async locks right now.
                 // Instead, we will panic when our assumption appears broken.
-                let removed_inode = children
+                let removed_ino = children
                     .remove(inode.name())
                     .expect("parent should contain child assuming VFS does not permit concurrent op on parent");
                 assert_eq!(
-                    removed_inode.ino(),
+                    removed_ino,
                     inode.ino(),
                     "child ino number shouldn't change assuming VFS does not permit concurrent op on parent",
                 );
@@ -598,7 +598,7 @@ impl SuperblockInner {
         // Fast path: try with only a read lock on the directory first.
         {
             let parent_state = parent.get_inode_state()?;
-            match Self::try_update_child(&parent_state, name, &remote)? {
+            match self.try_update_child(&parent_state, name, &remote)? {
                 UpdateStatus::Neither => return Err(InodeError::FileDoesNotExist),
                 UpdateStatus::Updated(lookedup) => return Ok(lookedup),
                 _ => {} // Fallback, we need a write lock to update the parent.
@@ -608,7 +608,7 @@ impl SuperblockInner {
         // If the fast path failed, take the write lock. We first have to try the update again, as
         // a racing writer might have beat us to the lock after our fast path attempt.
         let mut parent_state = parent.get_mut_inode_state()?;
-        match Self::try_update_child(&parent_state, name, &remote)? {
+        match self.try_update_child(&parent_state, name, &remote)? {
             UpdateStatus::Neither => Err(InodeError::FileDoesNotExist),
             UpdateStatus::Updated(lookedup) => Ok(lookedup),
             UpdateStatus::LocalOnly(inode) => {
@@ -648,17 +648,18 @@ impl SuperblockInner {
     /// return an [UpdateStatus].
     /// Don't use this directly -- use [SuperblockInner::update_from_remote] instead.
     fn try_update_child(
+        &self,
         parent_state: &InodeState,
         name: &str,
         remote: &Option<RemoteLookup>,
     ) -> Result<UpdateStatus, InodeError> {
         let inode = match &parent_state.kind_data {
             InodeKindData::File { .. } => unreachable!("we know parent is a directory"),
-            InodeKindData::Directory { children, .. } => children.get(name),
+            InodeKindData::Directory { children, .. } => children.get(name).and_then(|&ino| self.get(ino).ok()),
         };
         match (remote, inode) {
             (None, None) => Ok(UpdateStatus::Neither),
-            (None, Some(inode)) => Ok(UpdateStatus::LocalOnly(inode.clone())),
+            (None, Some(inode)) => Ok(UpdateStatus::LocalOnly(inode)),
             (Some(remote), None) => Ok(UpdateStatus::RemoteKey(remote.clone())),
             (
                 Some(
@@ -751,7 +752,7 @@ impl SuperblockInner {
                 writing_children,
                 ..
             } => {
-                children.insert(name.to_owned(), inode.clone());
+                children.insert(name.to_owned(), next_ino);
                 if is_new_file {
                     writing_children.insert(next_ino);
                 }
@@ -1026,7 +1027,7 @@ enum InodeKindData {
         /// How should this field be used?:
         /// - **Many operations should maintain** this list.
         /// - **Only `mknod` and `mkdir` should read** this list, for checking if a file already exists.
-        children: HashMap<String, Inode>,
+        children: HashMap<String, InodeNo>,
 
         /// A set of inode numbers that have been opened for write but not completed yet.
         /// This should be a subset of the [children](Self::Directory::children) field.

@@ -747,7 +747,10 @@ async fn test_directory_shadowing_readdir() {
     let bar_dentry = {
         let dir_handle = fs.opendir(foo_dir.attr.ino, 0).await.unwrap().fh;
         let mut reply = Default::default();
-        let _reply = fs.readdir(foo_dir.attr.ino, dir_handle, 0, &mut reply).await.unwrap();
+        let _reply = fs
+            .readdirplus(foo_dir.attr.ino, dir_handle, 0, &mut reply)
+            .await
+            .unwrap();
         fs.releasedir(foo_dir.attr.ino, dir_handle, 0).await.unwrap();
 
         // Skip . and .. to get to the `bar` dentry
@@ -768,7 +771,10 @@ async fn test_directory_shadowing_readdir() {
     let bar_dentry_new = {
         let dir_handle = fs.opendir(foo_dir.attr.ino, 0).await.unwrap().fh;
         let mut reply = Default::default();
-        let _reply = fs.readdir(bar_file.attr.ino, dir_handle, 0, &mut reply).await.unwrap();
+        let _reply = fs
+            .readdirplus(bar_file.attr.ino, dir_handle, 0, &mut reply)
+            .await
+            .unwrap();
         fs.releasedir(bar_file.attr.ino, dir_handle, 0).await.unwrap();
 
         // Skip . and .. to get to the `bar` dentry
@@ -791,7 +797,10 @@ async fn test_directory_shadowing_readdir() {
     let bar_dentry = {
         let dir_handle = fs.opendir(foo_dir.attr.ino, 0).await.unwrap().fh;
         let mut reply = Default::default();
-        let _reply = fs.readdir(foo_dir.attr.ino, dir_handle, 0, &mut reply).await.unwrap();
+        let _reply = fs
+            .readdirplus(foo_dir.attr.ino, dir_handle, 0, &mut reply)
+            .await
+            .unwrap();
         fs.releasedir(foo_dir.attr.ino, dir_handle, 0).await.unwrap();
 
         // Skip . and .. to get to the `bar` dentry
