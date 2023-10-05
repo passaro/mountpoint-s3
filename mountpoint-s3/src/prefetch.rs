@@ -7,32 +7,33 @@
 //! we increase the size of the GetObject requests up to some maximum. If the reader ever makes a
 //! non-sequential read, we abandon the prefetching and start again with the minimum request size.
 
+mod cached_feed;
 mod feed;
 mod part;
 mod part_queue;
 mod seek_window;
+mod task;
 
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::time::Duration;
 
-use futures::future::RemoteHandle;
-use futures::task::{Spawn, SpawnExt};
+use futures::task::Spawn;
 use metrics::{counter, histogram};
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_client::ObjectClient;
-use thiserror::Error;
-use tracing::{debug_span, error, trace, Instrument};
+use tracing::trace;
 
 use crate::checksums::{ChecksummedBytes, IntegrityError};
-use crate::prefetch::feed::{ClientPartFeed, ObjectPartFeed};
-use crate::prefetch::part::Part;
-use crate::prefetch::part_queue::{unbounded_part_queue, PartQueue};
+use crate::data_cache::in_memory_data_cache::InMemoryDataCache;
+use crate::prefetch::cached_feed::CachedPartFeed;
+use crate::prefetch::feed::{ClientPartFeed, ObjectPartFeed, RequestRange, TaskError};
 use crate::prefetch::seek_window::SeekWindow;
+use crate::prefetch::task::RequestTask;
 use crate::sync::Arc;
 
-type TaskError<Client> = ObjectClientError<GetObjectError, <Client as ObjectClient>::ClientError>;
+pub use crate::prefetch::task::PrefetchReadError;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PrefetcherConfig {
@@ -50,6 +51,14 @@ pub struct PrefetcherConfig {
     /// The maximum distance the prefetcher will seek backwards before resetting and starting a new
     /// S3 request. We keep this much data in memory in addition to any inflight requests.
     pub max_backward_seek_distance: u64,
+    /// Data cache configuration
+    pub data_cache_config: DataCacheConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DataCacheConfig {
+    NoCache,
+    InMemoryCache { block_size: usize },
 }
 
 impl Default for PrefetcherConfig {
@@ -74,6 +83,7 @@ impl Default for PrefetcherConfig {
             // just start a new request instead.
             max_forward_seek_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 1 * 1024 * 1024,
+            data_cache_config: DataCacheConfig::NoCache,
         }
     }
 }
@@ -85,9 +95,8 @@ pub struct Prefetcher<Client, Runtime> {
 }
 
 struct PrefetcherInner<Client, Runtime> {
-    part_feed: Arc<dyn ObjectPartFeed<Client> + Send + Sync>,
+    part_feed: Arc<dyn ObjectPartFeed<Client, Runtime> + Send + Sync>,
     config: PrefetcherConfig,
-    runtime: Runtime,
 }
 
 impl<Client, Runtime> Debug for PrefetcherInner<Client, Runtime> {
@@ -99,18 +108,32 @@ impl<Client, Runtime> Debug for PrefetcherInner<Client, Runtime> {
 impl<Client, Runtime> Prefetcher<Client, Runtime>
 where
     Client: ObjectClient + Send + Sync + 'static,
-    Runtime: Spawn,
+    Runtime: Spawn + Send + Sync + 'static,
 {
     /// Create a new [Prefetcher] that will make requests to the given client.
     pub fn new(client: Arc<Client>, runtime: Runtime, config: PrefetcherConfig) -> Self {
-        let part_feed = Arc::new(ClientPartFeed::new(client));
-        let inner = PrefetcherInner {
-            part_feed,
-            config,
-            runtime,
-        };
+        let part_feed = Self::create_part_feed(client, runtime, config.data_cache_config);
+        let inner = PrefetcherInner { part_feed, config };
 
         Self { inner: Arc::new(inner) }
+    }
+
+    fn create_part_feed(
+        client: Arc<Client>,
+        runtime: Runtime,
+        config: DataCacheConfig,
+    ) -> Arc<dyn ObjectPartFeed<Client, Runtime> + Send + Sync> {
+        match config {
+            DataCacheConfig::NoCache => Arc::new(ClientPartFeed::new(client, runtime)),
+            DataCacheConfig::InMemoryCache { block_size } => {
+                trace!("Using InMemoryDataCache");
+                Arc::new(CachedPartFeed::new(
+                    client,
+                    runtime,
+                    InMemoryDataCache::new(block_size as u64),
+                ))
+            }
+        }
     }
 
     /// Start a new get request to the specified object.
@@ -156,8 +179,8 @@ where
             future_tasks: Default::default(),
             backward_seek_window: SeekWindow::new(inner.config.max_backward_seek_distance as usize),
             preferred_part_size: 128 * 1024,
-            next_request_size: inner.config.first_request_size,
             next_sequential_read_offset: 0,
+            next_request_size: inner.config.first_request_size,
             next_request_offset: 0,
             bucket: bucket.to_owned(),
             key: key.to_owned(),
@@ -173,7 +196,7 @@ where
         &mut self,
         offset: u64,
         length: usize,
-    ) -> Result<ChecksummedBytes, PrefetchReadError<TaskError<Client>>> {
+    ) -> Result<ChecksummedBytes, PrefetchReadError<ObjectClientError<GetObjectError, Client::ClientError>>> {
         trace!(
             offset,
             length,
@@ -223,7 +246,7 @@ where
                 trace!(offset, length, "read beyond object size");
                 break;
             };
-            debug_assert!(current_task.remaining > 0);
+            debug_assert!(current_task.remaining() > 0);
 
             let part = match current_task.read(to_read as usize).await {
                 Err(e) => {
@@ -265,7 +288,7 @@ where
     /// Runs on every read to prepare and spawn any requests our prefetching logic requires
     fn prepare_requests(&mut self) {
         let current_task = self.current_task.as_ref();
-        if current_task.map(|task| task.remaining == 0).unwrap_or(true) {
+        if current_task.map(|task| task.remaining() == 0).unwrap_or(true) {
             // There's no current task, or the current task is finished. Prepare the next request.
             if let Some(next_task) = self.future_tasks.pop_front() {
                 self.current_task = Some(next_task);
@@ -275,7 +298,7 @@ where
         } else if current_task
             .map(|task| {
                 // Don't trigger prefetch if we're in a fake task created by backward streaming
-                task.is_streaming() && task.remaining <= task.total_size / 2
+                task.is_streaming() && task.remaining() <= task.total_size() / 2
             })
             .unwrap_or(false)
             && self.future_tasks.is_empty()
@@ -291,62 +314,35 @@ where
     /// Spawn the next required request
     fn spawn_next_request(&mut self) -> Option<RequestTask<TaskError<Client>>> {
         let start = self.next_request_offset;
-        let end = (start + self.next_request_size as u64).min(self.size);
-
         if start >= self.size {
             return None;
         }
 
-        let size = end - start;
-        let range = start..end;
-
-        let (part_queue, part_queue_producer) = unbounded_part_queue();
-
-        trace!(?range, size, "spawning request");
-
-        let request_task = {
-            let feed = self.inner.part_feed.clone();
-            let preferred_part_size = self.preferred_part_size;
-            let bucket = self.bucket.to_owned();
-            let key = self.key.to_owned();
-            let etag = self.etag.clone();
-            let span = debug_span!("prefetch", range=?range);
-
-            async move {
-                feed.get_object_parts(&bucket, &key, range, etag, preferred_part_size, part_queue_producer)
-                    .await
-            }
-            .instrument(span)
-        };
+        let range = RequestRange::new(self.size as usize, start, self.next_request_size);
+        let task = self.inner.part_feed.spawn_get_object_request(
+            &self.bucket,
+            &self.key,
+            self.etag.clone(),
+            range,
+            self.preferred_part_size,
+        );
 
         // [read] will reset these if the reader stops making sequential requests
-        self.next_request_offset += size;
-        self.next_request_size = self.get_next_request_size();
+        self.next_request_offset += task.total_size() as u64;
+        self.next_request_size = self.get_next_request_size(task.total_size());
 
-        let task_handle = self.inner.runtime.spawn_with_handle(request_task).unwrap();
-
-        Some(RequestTask {
-            task_handle: Some(task_handle),
-            total_size: size as usize,
-            remaining: size as usize,
-            start_offset: start,
-            part_queue,
-        })
+        Some(task)
     }
 
     /// Suggest next request size.
     /// The next request size is the current request size multiplied by sequential prefetch multiplier.
-    fn get_next_request_size(&self) -> usize {
+    fn get_next_request_size(&self, request_size: usize) -> usize {
         // TODO: this logic doesn't work well right now in the case where part_size <
         // first_request_size and sequential_prefetch_multiplier = 1. It ends up just repeatedly
         // shrinking the request size until it reaches 1. But this isn't a configuration we
         // currently expect to ever run in (part_size will always be >= 5MB for MPU reasons, and a
         // prefetcher with multiplier 1 is not very good).
-        let next_request_size = (self.next_request_size * self.inner.config.sequential_prefetch_multiplier)
-            .min(self.inner.config.max_request_size);
-        self.inner
-            .part_feed
-            .get_aligned_request_size(self.next_request_offset, next_request_size)
+        (request_size * self.inner.config.sequential_prefetch_multiplier).min(self.inner.config.max_request_size)
     }
 
     /// Reset this prefetch request to a new offset, clearing any existing tasks queued.
@@ -354,8 +350,8 @@ where
         self.current_task = None;
         self.future_tasks.drain(..);
         self.backward_seek_window.clear();
-        self.next_request_size = self.inner.config.first_request_size;
         self.next_sequential_read_offset = offset;
+        self.next_request_size = self.inner.config.first_request_size;
         self.next_request_offset = offset;
     }
 
@@ -379,20 +375,20 @@ where
             // Can't seek if there's no requests in flight at all
             return Ok(false);
         };
-        let future_remaining = self.future_tasks.iter().map(|task| task.remaining).sum::<usize>() as u64;
+        let future_remaining = self.future_tasks.iter().map(|task| task.remaining()).sum::<usize>() as u64;
         if total_seek_distance
-            >= (current_task.remaining as u64 + future_remaining).min(self.inner.config.max_forward_seek_distance)
+            >= (current_task.remaining() as u64 + future_remaining).min(self.inner.config.max_forward_seek_distance)
         {
             // TODO maybe adjust the next_request_size somehow if we were still within
             // max_forward_seek_distance, so that strides > first_request_size can still get
             // prefetched.
-            trace!(?current_task.remaining, ?future_remaining, "seek failed: not enough inflight data");
+            trace!(current_task_remaining=?current_task.remaining(), ?future_remaining, "seek failed: not enough inflight data");
             return Ok(false);
         }
 
         // Jump ahead to the right request
-        if total_seek_distance >= current_task.remaining as u64 {
-            self.next_sequential_read_offset += current_task.remaining as u64;
+        if total_seek_distance >= current_task.remaining() as u64 {
+            self.next_sequential_read_offset += current_task.remaining() as u64;
             self.current_task = None;
             while let Some(next_request) = self.future_tasks.pop_front() {
                 if next_request.end_offset() > offset {
@@ -437,17 +433,7 @@ where
         // We're going to create a new fake "request" that contains the parts we read out of the
         // window. That sounds a bit hacky, but it keeps all the read logic simple rather than
         // needing separate paths for backwards seeks vs others.
-        let (part_queue, part_queue_producer) = unbounded_part_queue();
-        for part in parts {
-            part_queue_producer.push(Ok(part));
-        }
-        let request = RequestTask {
-            task_handle: None,
-            remaining: backwards_length_needed as usize,
-            start_offset: offset,
-            total_size: backwards_length_needed as usize,
-            part_queue,
-        };
+        let request = RequestTask::from_parts(parts, offset);
         if let Some(current_task) = self.current_task.take() {
             self.future_tasks.push_front(current_task);
         }
@@ -460,49 +446,6 @@ where
     }
 }
 
-/// A single GetObject request submitted to the S3 client
-#[derive(Debug)]
-struct RequestTask<E> {
-    /// Handle on the task/future. The future is cancelled when handle is dropped. This is None if
-    /// the request is fake (created by seeking backwards in the stream)
-    task_handle: Option<RemoteHandle<()>>,
-    remaining: usize,
-    start_offset: u64,
-    total_size: usize,
-    part_queue: PartQueue<E>,
-}
-
-impl<E: std::error::Error + Send + Sync> RequestTask<E> {
-    async fn read(&mut self, length: usize) -> Result<Part, PrefetchReadError<E>> {
-        let part = self.part_queue.read(length).await?;
-        debug_assert!(part.len() <= self.remaining);
-        self.remaining -= part.len();
-        Ok(part)
-    }
-
-    fn end_offset(&self) -> u64 {
-        self.start_offset + self.total_size as u64
-    }
-
-    /// Some requests aren't actually streaming data (they're fake, created by backwards seeks), and
-    /// shouldn't be counted for prefetcher progress.
-    fn is_streaming(&self) -> bool {
-        self.task_handle.is_some()
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum PrefetchReadError<E: std::error::Error> {
-    #[error("get request failed")]
-    GetRequestFailed(#[source] E),
-
-    #[error("get request terminated unexpectedly")]
-    GetRequestTerminatedUnexpectedly,
-
-    #[error("integrity check failed")]
-    Integrity(#[from] IntegrityError),
-}
-
 #[cfg(test)]
 mod tests {
     // It's convenient to write test constants like "1 * 1024 * 1024" for symmetry
@@ -512,8 +455,8 @@ mod tests {
     use futures::executor::{block_on, ThreadPool};
     use mountpoint_s3_client::failure_client::{countdown_failure_client, RequestFailureMap};
     use mountpoint_s3_client::mock_client::{ramp_bytes, MockClient, MockClientConfig, MockClientError, MockObject};
-    use proptest::proptest;
     use proptest::strategy::{Just, Strategy};
+    use proptest::{prop_oneof, proptest};
     use proptest_derive::Arbitrary;
     use std::collections::HashMap;
     use test_case::test_case;
@@ -535,6 +478,15 @@ mod tests {
         max_forward_seek_distance: u64,
         #[proptest(strategy = "1u64..4*1024*1024")]
         max_backward_seek_distance: u64,
+        #[proptest(strategy = "data_cache_config_strategy()")]
+        data_cache_config: DataCacheConfig,
+    }
+
+    fn data_cache_config_strategy() -> impl Strategy<Value = DataCacheConfig> {
+        prop_oneof![
+            Just(DataCacheConfig::NoCache),
+            (16usize..2 * 1024 * 1024).prop_map(|block_size| DataCacheConfig::InMemoryCache { block_size })
+        ]
     }
 
     fn run_sequential_read_test(size: u64, read_size: usize, test_config: TestConfig) {
@@ -555,6 +507,7 @@ mod tests {
             read_timeout: Duration::from_secs(5),
             max_forward_seek_distance: test_config.max_forward_seek_distance,
             max_backward_seek_distance: test_config.max_backward_seek_distance,
+            data_cache_config: test_config.data_cache_config,
         };
         let runtime = ThreadPool::builder().pool_size(1).create().unwrap();
         let prefetcher = Prefetcher::new(Arc::new(client), runtime, test_config);
@@ -575,8 +528,9 @@ mod tests {
         assert_eq!(next_offset, size);
     }
 
-    #[test]
-    fn sequential_read_small() {
+    #[test_case(DataCacheConfig::NoCache)]
+    #[test_case(DataCacheConfig::InMemoryCache { block_size: 1 * MB })]
+    fn sequential_read_small(data_cache_config: DataCacheConfig) {
         let config = TestConfig {
             first_request_size: 256 * 1024,
             max_request_size: 1024 * 1024 * 1024,
@@ -584,12 +538,14 @@ mod tests {
             client_part_size: 8 * 1024 * 1024,
             max_forward_seek_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
+            data_cache_config,
         };
         run_sequential_read_test(1024 * 1024 + 111, 1024 * 1024, config);
     }
 
-    #[test]
-    fn sequential_read_medium() {
+    #[test_case(DataCacheConfig::NoCache)]
+    #[test_case(DataCacheConfig::InMemoryCache { block_size: 1 * MB })]
+    fn sequential_read_medium(data_cache_config: DataCacheConfig) {
         let config = TestConfig {
             first_request_size: 256 * 1024,
             max_request_size: 64 * 1024 * 1024,
@@ -597,12 +553,14 @@ mod tests {
             client_part_size: 8 * 1024 * 1024,
             max_forward_seek_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
+            data_cache_config,
         };
         run_sequential_read_test(16 * 1024 * 1024 + 111, 1024 * 1024, config);
     }
 
-    #[test]
-    fn sequential_read_large() {
+    #[test_case(DataCacheConfig::NoCache)]
+    #[test_case(DataCacheConfig::InMemoryCache { block_size: 1 * MB })]
+    fn sequential_read_large(data_cache_config: DataCacheConfig) {
         let config = TestConfig {
             first_request_size: 256 * 1024,
             max_request_size: 64 * 1024 * 1024,
@@ -610,6 +568,7 @@ mod tests {
             client_part_size: 8 * 1024 * 1024,
             max_forward_seek_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
+            data_cache_config,
         };
         run_sequential_read_test(256 * 1024 * 1024 + 111, 1024 * 1024, config);
     }
@@ -661,10 +620,15 @@ mod tests {
         assert!(next_offset < size); // Since we're injecting failures, shouldn't make it to the end
     }
 
-    #[test_case("invalid range; length=42")]
+    #[test_case("invalid range; length=42", DataCacheConfig::NoCache)]
+    #[test_case("invalid range; length=42", DataCacheConfig::InMemoryCache { block_size: 1 * MB })]
     // test case for the request failure due to etag not matching
-    #[test_case("At least one of the pre-conditions you specified did not hold")]
-    fn fail_request_sequential_small(err_value: &str) {
+    #[test_case(
+        "At least one of the pre-conditions you specified did not hold",
+        DataCacheConfig::NoCache
+    )]
+    #[test_case("At least one of the pre-conditions you specified did not hold", DataCacheConfig::InMemoryCache { block_size: 1 * MB })]
+    fn fail_request_sequential_small(err_value: &str, data_cache_config: DataCacheConfig) {
         let config = TestConfig {
             first_request_size: 256 * 1024,
             max_request_size: 1024 * 1024 * 1024,
@@ -672,6 +636,7 @@ mod tests {
             client_part_size: 8 * 1024 * 1024,
             max_forward_seek_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
+            data_cache_config,
         };
 
         let mut get_failures = HashMap::new();
@@ -700,6 +665,7 @@ mod tests {
         part_size: usize,
         expected_size: usize,
     ) {
+        // TODO: rework test
         let object_size = 50 * 1024 * 1024;
 
         let config = MockClientConfig {
@@ -715,6 +681,7 @@ mod tests {
             read_timeout: Duration::from_secs(60),
             max_forward_seek_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
+            data_cache_config: DataCacheConfig::NoCache,
         };
         let runtime = ThreadPool::builder().pool_size(1).create().unwrap();
         let prefetcher = Prefetcher::new(Arc::new(client), runtime, test_config);
@@ -723,8 +690,9 @@ mod tests {
         let mut request = prefetcher.get("test-bucket", "hello", object_size, etag);
 
         request.next_request_offset = next_request_offset as u64;
-        request.next_request_size = current_request_size;
-        let next_request_size = request.get_next_request_size();
+        request.next_request_size = request.get_next_request_size(current_request_size);
+        let task = request.spawn_next_request();
+        let next_request_size = task.map_or(0, |t| t.total_size());
         assert_eq!(next_request_size, expected_size);
     }
 
@@ -756,6 +724,7 @@ mod tests {
             client_part_size: 181682,
             max_forward_seek_distance: 1,
             max_backward_seek_distance: 18668,
+            data_cache_config: DataCacheConfig::NoCache,
         };
         run_sequential_read_test(object_size, read_size, config);
     }
@@ -841,6 +810,7 @@ mod tests {
             client_part_size: 516882,
             max_forward_seek_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
+            data_cache_config: DataCacheConfig::NoCache,
         };
         run_random_read_test(object_size, reads, config);
     }
@@ -856,6 +826,7 @@ mod tests {
             client_part_size: 1219731,
             max_forward_seek_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 2 * 1024 * 1024,
+            data_cache_config: DataCacheConfig::NoCache,
         };
         run_random_read_test(object_size, reads, config);
     }
@@ -871,6 +842,7 @@ mod tests {
             client_part_size: 1219731,
             max_forward_seek_distance: 2260662,
             max_backward_seek_distance: 2369799,
+            data_cache_config: DataCacheConfig::NoCache,
         };
         run_random_read_test(object_size, reads, config);
     }
@@ -886,6 +858,7 @@ mod tests {
             client_part_size: 1972409,
             max_forward_seek_distance: 2810651,
             max_backward_seek_distance: 3531090,
+            data_cache_config: DataCacheConfig::NoCache,
         };
         run_random_read_test(object_size, reads, config);
     }

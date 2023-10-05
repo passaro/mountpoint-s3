@@ -55,7 +55,7 @@ pub struct S3FuseFilesystem<Client: ObjectClient, Runtime> {
 impl<Client, Runtime> S3FuseFilesystem<Client, Runtime>
 where
     Client: ObjectClient + Send + Sync + 'static,
-    Runtime: Spawn + Send + Sync,
+    Runtime: Spawn + Send + Sync + 'static,
 {
     pub fn new(client: Client, runtime: Runtime, bucket: &str, prefix: &Prefix, config: S3FilesystemConfig) -> Self {
         let fs = S3Filesystem::new(client, runtime, bucket, prefix, config);
@@ -67,7 +67,7 @@ where
 impl<Client, Runtime> Filesystem for S3FuseFilesystem<Client, Runtime>
 where
     Client: ObjectClient + Send + Sync + 'static,
-    Runtime: Spawn + Send + Sync,
+    Runtime: Spawn + Send + Sync + 'static,
 {
     #[instrument(level="warn", skip_all, fields(req=_req.unique()))]
     fn init(&self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {

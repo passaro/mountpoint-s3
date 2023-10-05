@@ -348,7 +348,7 @@ pub struct S3Filesystem<Client: ObjectClient, Runtime> {
 impl<Client, Runtime> S3Filesystem<Client, Runtime>
 where
     Client: ObjectClient + Send + Sync + 'static,
-    Runtime: Spawn + Send + Sync,
+    Runtime: Spawn + Send + Sync + 'static,
 {
     pub fn new(client: Client, runtime: Runtime, bucket: &str, prefix: &Prefix, config: S3FilesystemConfig) -> Self {
         let superblock = Superblock::new(bucket, prefix, config.cache_config.clone());
@@ -433,7 +433,7 @@ pub trait ReadReplier {
 impl<Client, Runtime> S3Filesystem<Client, Runtime>
 where
     Client: ObjectClient + Send + Sync + 'static,
-    Runtime: Spawn + Send + Sync,
+    Runtime: Spawn + Send + Sync + 'static,
 {
     pub async fn init(&self, config: &mut KernelConfig) -> Result<(), libc::c_int> {
         let _ = config.add_capabilities(fuser::consts::FUSE_DO_READDIRPLUS);
