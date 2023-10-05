@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _};
 use clap::{value_parser, Parser};
 use fuser::{MountOption, Session};
-use mountpoint_s3::fs::{CacheConfig, S3FilesystemConfig};
+use mountpoint_s3::fs::S3FilesystemConfig;
 use mountpoint_s3::fuse::session::FuseSession;
 use mountpoint_s3::fuse::S3FuseFilesystem;
 use mountpoint_s3::instance::InstanceInfo;
@@ -237,6 +237,25 @@ struct CliArgs {
         requires = "enable_metadata_caching",
     )]
     pub metadata_cache_ttl: Option<Duration>,
+
+    #[cfg(feature = "caching")]
+    #[clap(
+        long,
+        help = "Enable caching of object data in memory",
+        help_heading = CACHING_OPTIONS_HEADER,
+    )]
+    pub enable_data_caching: bool,
+
+    #[cfg(feature = "caching")]
+    #[clap(
+        long,
+        help = "Block size for the data cache",
+        default_value = "1048576",
+        value_parser = value_parser!(u64).range(1..),
+        help_heading = CACHING_OPTIONS_HEADER,
+        requires = "enable_data_caching",
+    )]
+    pub data_cache_block_size: u64,
 
     #[clap(
         long,
@@ -502,6 +521,9 @@ fn mount(args: CliArgs) -> anyhow::Result<FuseSession> {
 
     #[cfg(feature = "caching")]
     {
+        use mountpoint_s3::fs::CacheConfig;
+        use mountpoint_s3::prefetch::DataCacheConfig;
+
         if args.enable_metadata_caching {
             // TODO: Review default for TTL
             let metadata_cache_ttl = args.metadata_cache_ttl.unwrap_or(Duration::from_secs(3600));
@@ -510,6 +532,11 @@ fn mount(args: CliArgs) -> anyhow::Result<FuseSession> {
                 dir_ttl: metadata_cache_ttl,
                 file_ttl: metadata_cache_ttl,
             };
+        }
+
+        if args.enable_data_caching {
+            let block_size = args.data_cache_block_size as usize;
+            filesystem_config.prefetcher_config.data_cache_config = DataCacheConfig::InMemoryCache { block_size };
         }
     }
 

@@ -24,14 +24,86 @@ pub trait ObjectPartFeed<Client: ObjectClient> {
         &self,
         bucket: &str,
         key: &str,
-        range: Range<u64>,
+        range: RequestRange,
         if_match: ETag,
         preferred_part_size: usize,
         part_sink: PartQueueProducer<ObjectClientError<GetObjectError, Client::ClientError>>,
     );
 
     /// Adjust the size of a request to align to optimal part boundaries for this client.
-    fn get_aligned_request_size(&self, offset: u64, preferred_size: usize) -> usize;
+    fn get_aligned_request_range(&self, object_size: usize, offset: u64, preferred_size: usize) -> RequestRange;
+}
+
+/// The range of a [ObjectPartFeed::get_object_parts] request.
+/// Includes the total size of the object.
+#[derive(Clone, Copy)]
+pub struct RequestRange {
+    object_size: usize,
+    offset: u64,
+    size: usize,
+}
+
+impl RequestRange {
+    pub fn new(object_size: usize, offset: u64, size: usize) -> Self {
+        let size = size.min(object_size.saturating_sub(offset as usize));
+        Self {
+            object_size,
+            offset,
+            size,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    pub fn object_size(&self) -> usize {
+        self.object_size
+    }
+
+    pub fn start(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn end(&self) -> u64 {
+        self.offset + self.size as u64
+    }
+
+    pub fn trim_start(&self, start_offset: u64) -> Self {
+        let offset = start_offset.max(self.offset);
+        let size = self.end().saturating_sub(offset) as usize;
+        Self {
+            object_size: self.object_size,
+            offset,
+            size,
+        }
+    }
+
+    pub fn trim_end(&self, end_offset: u64) -> Self {
+        let end = end_offset.min(self.end());
+        let size = end.saturating_sub(self.offset) as usize;
+        Self {
+            object_size: self.object_size,
+            offset: self.offset,
+            size,
+        }
+    }
+}
+
+impl From<RequestRange> for Range<u64> {
+    fn from(val: RequestRange) -> Self {
+        val.start()..val.end()
+    }
+}
+
+impl Debug for RequestRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}..{} out of {}", self.start(), self.end(), self.object_size())
+    }
 }
 
 /// [ObjectPartFeed] implementation which delegates retrieving object data to a [Client].
@@ -55,13 +127,17 @@ where
         &self,
         bucket: &str,
         key: &str,
-        range: Range<u64>,
+        range: RequestRange,
         if_match: ETag,
         preferred_part_size: usize,
         part_queue_producer: PartQueueProducer<ObjectClientError<GetObjectError, Client::ClientError>>,
     ) {
         assert!(preferred_part_size > 0);
-        let get_object_result = match self.client.get_object(bucket, key, Some(range), Some(if_match)).await {
+        let get_object_result = match self
+            .client
+            .get_object(bucket, key, Some(range.into()), Some(if_match))
+            .await
+        {
             Ok(get_object_result) => get_object_result,
             Err(e) => {
                 error!(error=?e, "GetObject request failed");
@@ -105,11 +181,11 @@ where
         trace!("request finished");
     }
 
-    fn get_aligned_request_size(&self, offset: u64, preferred_length: usize) -> usize {
+    fn get_aligned_request_range(&self, object_size: usize, offset: u64, preferred_length: usize) -> RequestRange {
         // If the request size is bigger than a part size we will try to align it to part boundaries.
         let part_alignment = self.client.part_size().unwrap_or(8 * 1024 * 1024);
         let offset_in_part = (offset % part_alignment as u64) as usize;
-        if offset_in_part != 0 {
+        let size = if offset_in_part != 0 {
             // if the offset is not at the start of the part we will drain all the bytes from that part first
             let remaining_in_part = part_alignment - offset_in_part;
             preferred_length.min(remaining_in_part)
@@ -123,6 +199,7 @@ where
                 let remainder = (request_boundary % part_alignment as u64) as usize;
                 preferred_length - remainder
             }
-        }
+        };
+        RequestRange::new(object_size, offset, size)
     }
 }
