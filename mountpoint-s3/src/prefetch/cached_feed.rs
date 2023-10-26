@@ -3,17 +3,13 @@ use std::{ops::Range, sync::Arc};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{pin_mut, StreamExt};
-use mountpoint_s3_client::{
-    error::{GetObjectError, ObjectClientError},
-    types::ETag,
-    ObjectClient,
-};
+use mountpoint_s3_client::{types::ETag, ObjectClient};
 use tracing::{error, trace, warn};
 
 use crate::checksums::ChecksummedBytes;
 use crate::data_cache::{BlockIndex, DataCache};
 use crate::prefetch::{
-    feed::{ObjectPartFeed, RequestRange},
+    feed::{ObjectPartFeed, ObjectPartFeedError, RequestRange},
     part::Part,
     part_queue::PartQueueProducer,
 };
@@ -46,7 +42,7 @@ where
         range: RequestRange,
         if_match: ETag,
         _preferred_part_size: usize,
-        part_queue_producer: PartQueueProducer<ObjectClientError<GetObjectError, Client::ClientError>>,
+        part_queue_producer: PartQueueProducer<ObjectPartFeedError<Client::ClientError>>,
     ) {
         let block_size = self.cache.block_size();
         let block_range = block_indices_for_byte_range(&range, block_size);
@@ -144,7 +140,7 @@ where
         cache_key: &CacheKey,
         range: RequestRange,
         block_range: Range<u64>,
-        part_queue_producer: PartQueueProducer<ObjectClientError<GetObjectError, Client::ClientError>>,
+        part_queue_producer: PartQueueProducer<ObjectPartFeedError<Client::ClientError>>,
     ) {
         let key = &cache_key.0;
         let block_size = self.cache.block_size();
@@ -172,7 +168,7 @@ where
             Ok(get_object_result) => get_object_result,
             Err(e) => {
                 error!(key, error=?e, "GetObject request failed");
-                part_queue_producer.push(Err(e));
+                part_queue_producer.push(Err(ObjectPartFeedError::GetRequestFailed(e)));
                 return;
             }
         };
@@ -190,7 +186,11 @@ where
                     while !body.is_empty() {
                         let remaining = (block_size as usize).saturating_sub(buffer.len()).min(body.len());
                         let chunk = body.split_to(remaining);
-                        buffer.extend(chunk.into()).unwrap();
+                        if let Err(e) = buffer.extend(chunk.into()) {
+                            error!(key, error=?e, "Integrity check failed");
+                            part_queue_producer.push(Err(ObjectPartFeedError::Integrity(e)));
+                            return;
+                        }
                         if buffer.len() < block_size as usize {
                             break;
                         }
@@ -202,7 +202,7 @@ where
                 }
                 Some(Err(e)) => {
                     error!(key, error=?e, "GetObject body part failed");
-                    part_queue_producer.push(Err(e));
+                    part_queue_producer.push(Err(ObjectPartFeedError::GetRequestFailed(e)));
                     break;
                 }
                 None => {

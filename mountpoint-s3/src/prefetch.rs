@@ -29,13 +29,13 @@ use tracing::{debug_span, error, trace, Instrument};
 use crate::checksums::{ChecksummedBytes, IntegrityError};
 use crate::data_cache::in_memory_data_cache::InMemoryDataCache;
 use crate::prefetch::cached_feed::CachedPartFeed;
-use crate::prefetch::feed::{ClientPartFeed, ObjectPartFeed, RequestRange};
+use crate::prefetch::feed::{ClientPartFeed, ObjectPartFeed, ObjectPartFeedError, RequestRange};
 use crate::prefetch::part::Part;
 use crate::prefetch::part_queue::{unbounded_part_queue, PartQueue};
 use crate::prefetch::seek_window::SeekWindow;
 use crate::sync::Arc;
 
-type TaskError<Client> = ObjectClientError<GetObjectError, <Client as ObjectClient>::ClientError>;
+type TaskError<Client> = ObjectPartFeedError<<Client as ObjectClient>::ClientError>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PrefetcherConfig {
@@ -197,7 +197,7 @@ where
         &mut self,
         offset: u64,
         length: usize,
-    ) -> Result<ChecksummedBytes, PrefetchReadError<TaskError<Client>>> {
+    ) -> Result<ChecksummedBytes, PrefetchReadError<ObjectClientError<GetObjectError, Client::ClientError>>> {
         trace!(
             offset,
             length,
@@ -252,7 +252,7 @@ where
             let part = match current_task.read(to_read as usize).await {
                 Err(e) => {
                     self.reset_prefetch_to_offset(offset);
-                    return Err(e);
+                    return Err(e.into());
                 }
                 Ok(part) => part,
             };
@@ -532,6 +532,22 @@ pub enum PrefetchReadError<E: std::error::Error> {
 
     #[error("integrity check failed")]
     Integrity(#[from] IntegrityError),
+}
+
+impl<E> From<PrefetchReadError<ObjectPartFeedError<E>>> for PrefetchReadError<ObjectClientError<GetObjectError, E>>
+where
+    E: std::error::Error + 'static,
+{
+    fn from(value: PrefetchReadError<ObjectPartFeedError<E>>) -> Self {
+        match value {
+            PrefetchReadError::GetRequestFailed(ObjectPartFeedError::GetRequestFailed(e)) => {
+                PrefetchReadError::GetRequestFailed(e)
+            }
+            PrefetchReadError::GetRequestFailed(ObjectPartFeedError::Integrity(e)) => PrefetchReadError::Integrity(e),
+            PrefetchReadError::Integrity(e) => PrefetchReadError::Integrity(e),
+            PrefetchReadError::GetRequestTerminatedUnexpectedly => PrefetchReadError::GetRequestTerminatedUnexpectedly,
+        }
+    }
 }
 
 #[cfg(test)]

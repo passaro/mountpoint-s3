@@ -9,9 +9,10 @@ use mountpoint_s3_client::{
     ObjectClient,
 };
 use mountpoint_s3_crt::checksums::crc32c;
+use thiserror::Error;
 use tracing::{error, trace};
 
-use crate::checksums::ChecksummedBytes;
+use crate::checksums::{ChecksummedBytes, IntegrityError};
 use crate::prefetch::{part::Part, part_queue::PartQueueProducer};
 
 /// A generic interface to retrieve data from objects in a S3-like store.
@@ -27,11 +28,20 @@ pub trait ObjectPartFeed<Client: ObjectClient> {
         range: RequestRange,
         if_match: ETag,
         preferred_part_size: usize,
-        part_sink: PartQueueProducer<ObjectClientError<GetObjectError, Client::ClientError>>,
+        part_sink: PartQueueProducer<ObjectPartFeedError<Client::ClientError>>,
     );
 
     /// Adjust the size of a request to align to optimal part boundaries for this client.
     fn get_aligned_request_range(&self, object_size: usize, offset: u64, preferred_size: usize) -> RequestRange;
+}
+
+#[derive(Debug, Error)]
+pub enum ObjectPartFeedError<ClientError: std::error::Error> {
+    #[error("get request failed")]
+    GetRequestFailed(#[source] ObjectClientError<GetObjectError, ClientError>),
+
+    #[error("integrity check failed")]
+    Integrity(#[source] IntegrityError),
 }
 
 /// The range of a [ObjectPartFeed::get_object_parts] request.
@@ -130,7 +140,7 @@ where
         range: RequestRange,
         if_match: ETag,
         preferred_part_size: usize,
-        part_queue_producer: PartQueueProducer<ObjectClientError<GetObjectError, Client::ClientError>>,
+        part_queue_producer: PartQueueProducer<ObjectPartFeedError<Client::ClientError>>,
     ) {
         assert!(preferred_part_size > 0);
         let get_object_result = match self
@@ -141,7 +151,7 @@ where
             Ok(get_object_result) => get_object_result,
             Err(e) => {
                 error!(error=?e, "GetObject request failed");
-                part_queue_producer.push(Err(e));
+                part_queue_producer.push(Err(ObjectPartFeedError::GetRequestFailed(e)));
                 return;
             }
         };
@@ -172,7 +182,7 @@ where
                 }
                 Some(Err(e)) => {
                     error!(error=?e, "GetObject body part failed");
-                    part_queue_producer.push(Err(e));
+                    part_queue_producer.push(Err(ObjectPartFeedError::GetRequestFailed(e)));
                     break;
                 }
                 None => break,
