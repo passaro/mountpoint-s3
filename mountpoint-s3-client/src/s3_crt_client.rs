@@ -291,11 +291,31 @@ impl S3CrtClientInner {
 
         client_config.throughput_target_gbps(config.throughput_target_gbps);
 
-        if !(5 * 1024 * 1024..=5 * 1024 * 1024 * 1024).contains(&config.part_size) {
+        // Validate part_size.
+        // Constraints derived from CRT code.
+        // for part_size, see `aws_s3_buffer_pool_new` (`aws-c-s3/source/s3_buffer_pool.c`)
+        if config.part_size != 0 && (config.part_size <= 1024 || config.part_size % 1024 != 0) {
             return Err(NewClientError::InvalidConfiguration(
-                "part size must be at between 5MiB and 5GiB".into(),
+                "part size must be either 0 or more than 1 KB and size must be 1 KB aligned".into(),
             ));
         }
+        const BUFFER_POOL_RESERVED_MEM: usize = 128 * 1024 * 1024;
+        const CHUNKS_PER_BLOCK: usize = 16;
+        // for mem_limit, see `aws_s3_client_new` (`aws-c-s3/source/s3_client.c`)
+        let mem_limit: usize = match config.throughput_target_gbps {
+            t if t > 75.0 => 8 * 1024 * 1024 * 1024,
+            t if t > 25.0 => 4 * 1024 * 1024 * 1024,
+            _ => 2 * 1024 * 1024 * 1024,
+        };
+        let adjusted_mem_limit = mem_limit - BUFFER_POOL_RESERVED_MEM;
+        if config.part_size * CHUNKS_PER_BLOCK > adjusted_mem_limit {
+            // We do not expose the memory limit, the CRT will compute it depending on target throughput.
+            return Err(NewClientError::InvalidConfiguration(
+                "part size is too large for the throughput target. Consider adjusting throughput target or part size."
+                    .into(),
+            ));
+        }
+
         client_config.part_size(config.part_size);
 
         let user_agent = config.user_agent.unwrap_or_else(|| UserAgent::new(None));
@@ -1034,16 +1054,25 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    /// Test both explicit validation in [Client::new] and implicit limits in the CRT
-    #[test_case(4 * 1024 * 1024; "less than 5MiB")] // validated in Client::new
-    #[test_case(10_000_000; "not a multiple of 1024")] // CRT constraint
-    #[test_case(6 * 1024 * 1024 * 1024; "greater than 5GiB")] // validated in Client::new
-    fn client_new_fails_with_invalid_part_size(part_size: usize) {
-        let config = S3ClientConfig {
-            part_size,
-            ..Default::default()
-        };
-        S3CrtClient::new(config).expect_err("creating a new client should fail");
+    #[test_case(512, None, true; "less than 1KiB")]
+    #[test_case(1024, None, true; "1KiB")]
+    #[test_case(10_000_000, None, true; "not a multiple of 1024")]
+    #[test_case((2 * 1024 - 128) * 1024 * 1024 / 16 + 1024, None, true; "too large (with default throughput)")]
+    #[test_case((4 * 1024 - 128) * 1024 * 1024 / 16 + 1024, Some(30.0), true; "too large (with 30 throughput)")]
+    #[test_case((8 * 1024 - 128) * 1024 * 1024 / 16 + 1024, Some(80.0), true; "too large (with 80 throughput)")]
+    #[test_case(0, None, false; "zero")]
+    #[test_case(10_000 * 1024, None, false; "multiple of 1024")]
+    #[test_case(8 * 1024 * 1024, None, false; "default value (8MiB)")]
+    #[test_case((2 * 1024 - 128) * 1024 * 1024 / 16, None, false; "maximum size (with default throughput)")]
+    #[test_case((4 * 1024 - 128) * 1024 * 1024 / 16, Some(30.0), false; "maximum size (with 30 throughput)")]
+    #[test_case((8 * 1024 - 128) * 1024 * 1024 / 16, Some(80.0), false; "maximum size (with 80 throughput)")]
+    fn client_new_validates_part_size(part_size: usize, throughput_target: Option<f64>, expect_error: bool) {
+        let mut config = S3ClientConfig::default().part_size(part_size);
+        if let Some(throughput_target) = throughput_target {
+            config = config.throughput_target_gbps(throughput_target);
+        }
+        let result = S3CrtClient::new(config);
+        assert_eq!(result.is_err(), expect_error);
     }
 
     /// Test if the prefix is added correctly to the User-Agent header

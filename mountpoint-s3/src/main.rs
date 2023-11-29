@@ -149,7 +149,6 @@ struct CliArgs {
         long,
         help = "Part size for multi-part GET and PUT",
         default_value = "8388608",
-        value_parser = value_parser!(u64).range(1..),
         help_heading = CLIENT_OPTIONS_HEADER
     )]
     pub part_size: u64,
