@@ -114,6 +114,15 @@ pub mod mock_session {
 
     /// Create a FUSE mount backed by a mock object client that does not talk to S3
     pub fn new(test_name: &str, test_config: TestSessionConfig) -> (TempDir, BackgroundSession, TestClientBox) {
+        let (mount_dir, session, test_client) = new_mock_session(test_name, test_config);
+
+        (mount_dir, session, Box::new(test_client))
+    }
+
+    pub fn new_mock_session(
+        test_name: &str,
+        test_config: TestSessionConfig,
+    ) -> (TempDir, BackgroundSession, MockTestClient) {
         let mount_dir = tempfile::tempdir().unwrap();
 
         let prefix = if test_name.is_empty() {
@@ -138,7 +147,10 @@ pub mod mock_session {
             mount_dir.path(),
             test_config.filesystem_config,
         );
-        let test_client = create_test_client(client, &prefix);
+        let test_client = MockTestClient {
+            prefix: prefix.to_owned(),
+            client,
+        };
 
         (mount_dir, session, test_client)
     }
@@ -190,9 +202,9 @@ pub mod mock_session {
         Box::new(test_client)
     }
 
-    struct MockTestClient {
-        prefix: String,
-        client: Arc<MockClient>,
+    pub struct MockTestClient {
+        pub prefix: String,
+        pub client: Arc<MockClient>,
     }
 
     impl TestClient for MockTestClient {
