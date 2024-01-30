@@ -86,7 +86,7 @@ pub struct Superblock {
 struct SuperblockInner {
     bucket: String,
     inodes: RwLock<HashMap<InodeNo, Inode>>,
-    known_missing_keys: NegativeCache,
+    negative_cache: NegativeCache,
     next_ino: AtomicU64,
     mount_time: OffsetDateTime,
     config: SuperblockConfig,
@@ -124,13 +124,12 @@ impl Superblock {
         let mut inodes = HashMap::new();
         inodes.insert(ROOT_INODE_NO, root);
 
-        let known_missing_keys =
-            NegativeCache::new(config.cache_config.negative_cache_size, config.cache_config.file_ttl);
+        let negative_cache = NegativeCache::new(config.cache_config.negative_cache_size, config.cache_config.file_ttl);
 
         let inner = SuperblockInner {
             bucket: bucket.to_owned(),
             inodes: RwLock::new(inodes),
-            known_missing_keys,
+            negative_cache,
             next_ino: AtomicU64::new(2),
             mount_time,
             config,
@@ -657,7 +656,7 @@ impl SuperblockInner {
                 }
             };
 
-            if superblock.known_missing_keys.contains(parent.ino(), name) {
+            if superblock.negative_cache.contains(parent.ino(), name) {
                 return Some(Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err())));
             }
 
@@ -846,7 +845,7 @@ impl SuperblockInner {
             (None, None) => {
                 if self.config.cache_config.serve_lookup_from_cache {
                     // Insert or update validity of negative cache entry.
-                    self.known_missing_keys.insert(parent.ino(), name);
+                    self.negative_cache.insert(parent.ino(), name);
                 }
                 Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err()))
             }
@@ -889,7 +888,7 @@ impl SuperblockInner {
             (None, None) => {
                 if self.config.cache_config.serve_lookup_from_cache {
                     // Insert or update validity of negative cache entry.
-                    self.known_missing_keys.insert(parent.ino(), name);
+                    self.negative_cache.insert(parent.ino(), name);
                 }
                 Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err()))
             }
@@ -1065,7 +1064,7 @@ impl SuperblockInner {
                 if let Some(existing_inode) = existing_inode {
                     writing_children.remove(&existing_inode.ino());
                 } else {
-                    self.known_missing_keys.remove(parent.ino(), name);
+                    self.negative_cache.remove(parent.ino(), name);
                 }
             }
         }
