@@ -634,6 +634,8 @@ impl SuperblockInner {
 
     /// Lookup an [Inode] against known directory entries in the parent,
     /// verifying any returned entry has not expired.
+    /// If no record for the given `name` is found, returns [None].
+    /// If an entry is found in the negative cache, returns [Some(Err(InodeError::FileDoesNotExist))].
     fn cache_lookup(&self, parent_ino: InodeNo, name: &str) -> Option<Result<LookedUp, InodeError>> {
         fn do_cache_lookup(
             superblock: &SuperblockInner,
