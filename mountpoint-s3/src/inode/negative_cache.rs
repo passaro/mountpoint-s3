@@ -14,8 +14,8 @@ pub struct NegativeCache {
     map: RwLock<LinkedHashMap<Key, Expiry>>,
     /// Upper bound for the cache.
     max_size: usize,
-    /// Validity of a key at insertion.
-    validity: Duration,
+    /// TTL of a key at insertion.
+    ttl: Duration,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
@@ -25,15 +25,15 @@ struct Key {
 }
 
 impl NegativeCache {
-    pub fn new(max_size: usize, validity: Duration) -> Self {
+    pub fn new(max_size: usize, ttl: Duration) -> Self {
         Self {
             map: RwLock::new(Default::default()),
             max_size,
-            validity,
+            ttl,
         }
     }
 
-    /// Check whether the cache contains a **valid** entry for the given
+    /// Check whether the cache contains a **current** entry for the given
     /// (`parent_ino`, `child_name`) pair.
     pub fn contains(&self, parent_ino: InodeNo, child_name: &str) -> bool {
         let key = Key {
@@ -41,19 +41,19 @@ impl NegativeCache {
             child_name: child_name.to_owned(),
         };
         let start = Instant::now();
-        let contains_valid = self
+        let contains_current = self
             .map
             .read()
             .unwrap()
             .get(&key)
-            .is_some_and(|expiry| expiry.is_valid());
+            .is_some_and(|expiry| !expiry.is_expired());
         metrics::histogram!(
             "metadata_cache.negative_cache.operation_duration_us",
             start.elapsed().as_micros() as f64,
             "op" => "contains",
         );
-        metrics::counter!("metadata_cache.negative_cache.cache_hit", contains_valid.into());
-        contains_valid
+        metrics::counter!("metadata_cache.negative_cache.cache_hit", contains_current.into());
+        contains_current
     }
 
     /// Remove an entry from the cache. If the entry was not present, this is a no-op.
@@ -75,11 +75,11 @@ impl NegativeCache {
     }
 
     /// Insert an entry into the cache. If the entry already existed,
-    /// update its validity.
+    /// update its TTL.
     /// Upon insertion, remove entries that exceed the cache limit or
     /// that have already expired.
     pub fn insert(&self, parent_ino: InodeNo, child_name: &str) {
-        let expiry = Expiry::from_now(self.validity);
+        let expiry = Expiry::from_now(self.ttl);
         let key = Key {
             parent_ino,
             child_name: child_name.to_owned(),
@@ -87,8 +87,8 @@ impl NegativeCache {
         let start = Instant::now();
         let mut map = self.map.write().unwrap();
         if map.insert(key, expiry).is_none() {
-            // Remove entries that are no longer valid.
-            while map.front().is_some_and(|(_, e)| !e.is_valid()) {
+            // Remove entries that have expired.
+            while map.front().is_some_and(|(_, e)| e.is_expired()) {
                 _ = map.pop_front();
             }
 
@@ -97,10 +97,10 @@ impl NegativeCache {
                 let Some((_, e)) = map.pop_front() else {
                     break;
                 };
-                // Report how many valid entries are evicted.
+                // Report how many entries are evicted while still current.
                 metrics::counter!(
                     "metadata_cache.negative_cache.entries_evicted_before_expiry",
-                    e.is_valid().into()
+                    (!e.is_expired()).into()
                 );
             }
             metrics::gauge!("metadata_cache.negative_cache.entries", map.len() as f64);
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_resets_validity() {
+    fn test_insert_resets_ttl() {
         let cache = NegativeCache::new(100, Duration::from_millis(50));
 
         cache.insert(1, "child1");

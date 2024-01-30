@@ -844,7 +844,7 @@ impl SuperblockInner {
         match (remote, inode) {
             (None, None) => {
                 if self.config.cache_config.serve_lookup_from_cache {
-                    // Insert or update validity of negative cache entry.
+                    // Insert or update TTL of negative cache entry.
                     self.negative_cache.insert(parent.ino(), name);
                 }
                 Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err()))
@@ -887,7 +887,7 @@ impl SuperblockInner {
         match (remote, inode) {
             (None, None) => {
                 if self.config.cache_config.serve_lookup_from_cache {
-                    // Insert or update validity of negative cache entry.
+                    // Insert or update TTL of negative cache entry.
                     self.negative_cache.insert(parent.ino(), name);
                 }
                 Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err()))
@@ -1092,7 +1092,7 @@ pub struct LookedUp {
 impl LookedUp {
     /// How much longer this lookup will be valid for
     pub fn validity(&self) -> Duration {
-        self.stat.expiry.validity()
+        self.stat.expiry.remaining_ttl()
     }
 }
 
@@ -1512,7 +1512,7 @@ pub enum WriteStatus {
 
 impl InodeStat {
     fn is_valid(&self) -> bool {
-        self.expiry.is_valid()
+        !self.expiry.is_expired()
     }
 
     /// Objects in flexible retrieval storage classes can't be accessed via GetObject unless they are
