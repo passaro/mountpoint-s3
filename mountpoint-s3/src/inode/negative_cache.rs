@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_resets_ttl() {
+    fn test_insert_after_expiry() {
         let cache = NegativeCache::new(100, Duration::from_millis(50));
 
         cache.insert(1, "child1");
@@ -199,6 +199,19 @@ mod tests {
         assert!(!cache.contains(1, "child1"));
 
         cache.insert(1, "child1");
+        assert!(cache.contains(1, "child1"));
+    }
+
+    #[test]
+    fn test_insert_resets_ttl() {
+        let cache = NegativeCache::new(100, Duration::from_millis(100));
+
+        cache.insert(1, "child1");
+        sleep(Duration::from_millis(50));
+        assert!(cache.contains(1, "child1"));
+
+        cache.insert(1, "child1");
+        sleep(Duration::from_millis(75));
         assert!(cache.contains(1, "child1"));
     }
 }
