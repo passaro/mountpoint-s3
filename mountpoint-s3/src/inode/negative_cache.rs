@@ -33,6 +33,10 @@ impl NegativeCache {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.map.read().unwrap().len()
+    }
+
     /// Check whether the cache contains a **current** entry for the given
     /// (`parent_ino`, `child_name`) pair.
     pub fn contains(&self, parent_ino: InodeNo, child_name: &str) -> bool {

@@ -52,6 +52,7 @@ aws-config = "0.56.0"
 aws-sdk-s3 = "0.29.0"
 aws-sdk-sts = "0.29.0"
 base16ct = { version = "0.1.1", features = ["alloc"] }
+criterion = "0.3"
 ctor = "0.1.23"
 filetime = "0.2.21"
 predicates = "2.1.2"
@@ -83,3 +84,7 @@ built = { version = "0.6.0", features = ["git2"] }
 [[bin]]
 name = "mount-s3"
 path = "src/main.rs"
+
+[[bench]]
+name = "negative_cache"
+harness = false

@@ -51,7 +51,7 @@ mod expiry;
 use expiry::Expiry;
 
 mod negative_cache;
-use negative_cache::NegativeCache;
+pub use negative_cache::NegativeCache;
 
 mod readdir;
 pub use readdir::ReaddirHandle;
