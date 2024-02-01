@@ -822,8 +822,17 @@ impl SuperblockInner {
             return Err(InodeError::NotADirectory(parent.err()));
         }
 
+        if self.config.cache_config.serve_lookup_from_cache {
+            match &remote {
+                // Remove negative cache entry.
+                Some(_) => self.negative_cache.remove(parent_ino, name),
+                // Insert or update TTL of negative cache entry.
+                None => self.negative_cache.insert(parent_ino, name),
+            }
+        }
+
         // Fast path: try with only a read lock on the directory first.
-        if let Some(looked_up) = self.try_update_fast_path(&parent, name, &remote)? {
+        if let Some(looked_up) = Self::try_update_fast_path(&parent, name, &remote)? {
             return Ok(looked_up);
         }
 
@@ -833,7 +842,6 @@ impl SuperblockInner {
     /// Try to update the inode for the given name in the parent directory with only a read lock on
     /// the parent.
     fn try_update_fast_path(
-        &self,
         parent: &Inode,
         name: &str,
         remote: &Option<RemoteLookup>,
@@ -844,13 +852,7 @@ impl SuperblockInner {
             InodeKindData::Directory { children, .. } => children.get(name),
         };
         match (remote, inode) {
-            (None, None) => {
-                if self.config.cache_config.serve_lookup_from_cache {
-                    // Insert or update TTL of negative cache entry.
-                    self.negative_cache.insert(parent.ino(), name);
-                }
-                Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err()))
-            }
+            (None, None) => Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err())),
             (Some(remote), Some(existing_inode)) => {
                 let mut existing_state = existing_inode.get_mut_inode_state()?;
                 let existing_is_remote = existing_state.write_status == WriteStatus::Remote;
@@ -887,13 +889,7 @@ impl SuperblockInner {
             InodeKindData::Directory { children, .. } => children.get(name).cloned(),
         };
         match (remote, inode) {
-            (None, None) => {
-                if self.config.cache_config.serve_lookup_from_cache {
-                    // Insert or update TTL of negative cache entry.
-                    self.negative_cache.insert(parent.ino(), name);
-                }
-                Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err()))
-            }
+            (None, None) => Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err())),
             (None, Some(existing_inode)) => {
                 let InodeKindData::Directory {
                     children,
@@ -1065,8 +1061,6 @@ impl SuperblockInner {
                 }
                 if let Some(existing_inode) = existing_inode {
                     writing_children.remove(&existing_inode.ino());
-                } else {
-                    self.negative_cache.remove(parent.ino(), name);
                 }
             }
         }
