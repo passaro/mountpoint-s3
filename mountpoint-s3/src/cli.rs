@@ -34,6 +34,7 @@ use crate::fuse::S3FuseFilesystem;
 use crate::logging::{init_logging, LoggingConfig};
 use crate::prefetch::{caching_prefetch, default_prefetch, Prefetch};
 use crate::prefix::Prefix;
+use crate::upload::UploaderConfig;
 use crate::{autoconfigure, metrics};
 
 const CLIENT_OPTIONS_HEADER: &str = "Client options";
@@ -629,13 +630,14 @@ where
     if let Some(file_mode) = args.file_mode {
         filesystem_config.file_mode = file_mode;
     }
-    filesystem_config.storage_class = args.storage_class;
     filesystem_config.allow_delete = args.allow_delete;
     filesystem_config.allow_overwrite = args.allow_overwrite;
     filesystem_config.s3_personality = s3_personality;
-    {
-        filesystem_config.server_side_encryption = ServerSideEncryption::new(args.sse, args.sse_kms_key_id);
-    }
+    filesystem_config.uploader_config = UploaderConfig {
+        storage_class: args.storage_class,
+        server_side_encryption: ServerSideEncryption::new(args.sse, args.sse_kms_key_id),
+        ..Default::default()
+    };
 
     let prefetcher_config = Default::default();
 

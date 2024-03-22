@@ -2,6 +2,7 @@ pub mod autoconfigure;
 mod build_info;
 mod checksums;
 pub mod cli;
+mod counter;
 pub mod data_cache;
 pub mod fs;
 pub mod fuse;
@@ -14,7 +15,7 @@ pub mod prefix;
 mod sync;
 mod upload;
 
-pub use fs::{S3Filesystem, S3FilesystemConfig, ServerSideEncryption};
+pub use fs::{S3Filesystem, S3FilesystemConfig, ServerSideEncryption, UploaderConfig};
 
 /// Enable tracing and CRT logging when running unit tests.
 #[cfg(test)]

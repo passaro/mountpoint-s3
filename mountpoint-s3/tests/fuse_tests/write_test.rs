@@ -11,9 +11,9 @@ use rand_chacha::ChaCha20Rng;
 use tempfile::TempDir;
 use test_case::test_case;
 
-use mountpoint_s3::S3FilesystemConfig;
 #[cfg(all(feature = "s3_tests", not(feature = "s3express_tests")))]
 use mountpoint_s3::ServerSideEncryption;
+use mountpoint_s3::{S3FilesystemConfig, UploaderConfig};
 
 use crate::common::fuse::{self, read_dir_to_entry_names, TestClientBox, TestSessionConfig};
 #[cfg(all(feature = "s3_tests", not(feature = "s3express_tests")))]
@@ -426,7 +426,10 @@ where
 
     let config = TestSessionConfig {
         filesystem_config: S3FilesystemConfig {
-            storage_class: storage_class.map(String::from),
+            uploader_config: UploaderConfig {
+                storage_class: storage_class.map(String::from),
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..Default::default()
@@ -469,7 +472,10 @@ where
 
     let config = TestSessionConfig {
         filesystem_config: S3FilesystemConfig {
-            storage_class: Some(storage_class.to_owned()),
+            uploader_config: UploaderConfig {
+                storage_class: Some(storage_class.to_owned()),
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..Default::default()
@@ -1050,7 +1056,10 @@ fn write_with_sse_settings_test(policy: &str, sse: ServerSideEncryption, should_
         .replace("__SSE_KEY_ARN__", get_test_kms_key_id().as_str());
     let mut test_config =
         TestSessionConfig::default().with_credentials(tokio_block_on(get_scoped_down_credentials(&policy)));
-    test_config.filesystem_config.server_side_encryption = sse;
+    test_config.filesystem_config.uploader_config = UploaderConfig {
+        server_side_encryption: sse,
+        ..Default::default()
+    };
     let (mount_point, _session, test_client) = fuse::s3_session::new("sse_with_policy_test", test_config);
     let file_name = "hello";
     let path = mount_point.path().join(file_name);

@@ -3,7 +3,7 @@
 use tracing::Level;
 
 use crate::inode::InodeError;
-use crate::upload::UploadWriteError;
+use crate::upload::{UploadPutError, UploadWriteError};
 
 /// Generate an error that includes a conversion to a libc errno for use in replies to FUSE.
 ///
@@ -110,6 +110,23 @@ impl<E: std::error::Error + Send + Sync + 'static> From<UploadWriteError<E>> for
     }
 }
 
+impl<S, C> From<UploadPutError<S, C>> for Error
+where
+    S: std::error::Error + Send + Sync + 'static,
+    C: std::error::Error + Send + Sync + 'static,
+{
+    fn from(err: UploadPutError<S, C>) -> Self {
+        let errno = err.to_errno();
+        Error {
+            errno,
+            message: String::from("put failed to start"),
+            source: Some(anyhow::anyhow!(err)),
+            // We are having WARN as the default level of logging for fuse errors
+            level: Level::WARN,
+        }
+    }
+}
+
 /// Errors that can be converted to a raw OS error (errno)
 pub trait ToErrno {
     fn to_errno(&self) -> libc::c_int;
@@ -154,6 +171,16 @@ impl<E: std::error::Error> ToErrno for UploadWriteError<E> {
             UploadWriteError::PutRequestFailed(_) => libc::EIO,
             UploadWriteError::OutOfOrderWrite { .. } => libc::EINVAL,
             UploadWriteError::ObjectTooBig { .. } => libc::EFBIG,
+        }
+    }
+}
+
+impl<S, C> ToErrno for UploadPutError<S, C> {
+    fn to_errno(&self) -> libc::c_int {
+        match self {
+            UploadPutError::ClientError(_) => libc::EIO,
+            UploadPutError::SseCorruptedError(_) => libc::EIO,
+            UploadPutError::TooManyConcurrentUploads(_) => libc::EMFILE,
         }
     }
 }

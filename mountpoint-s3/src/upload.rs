@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
 use mountpoint_s3_client::checksums::crc32c_from_base64;
 use mountpoint_s3_client::error::{ObjectClientError, PutObjectError};
@@ -10,7 +10,9 @@ use thiserror::Error;
 use tracing::error;
 
 use crate::checksums::combine_checksums;
+use crate::counter::{BoundedCounter, CounterToken};
 use crate::fs::{ServerSideEncryption, SseCorruptedError};
+use crate::sync::Arc;
 
 type PutRequestError<Client> = ObjectClientError<PutObjectError, <Client as ObjectClient>::ClientError>;
 
@@ -19,14 +21,30 @@ const MAX_S3_MULTIPART_UPLOAD_PARTS: usize = 10000;
 /// An [Uploader] creates and manages streaming PutObject requests.
 #[derive(Debug)]
 pub struct Uploader<Client> {
-    inner: Arc<UploaderInner<Client>>,
-}
-
-#[derive(Debug)]
-struct UploaderInner<Client> {
     client: Arc<Client>,
     storage_class: Option<String>,
     server_side_encryption: ServerSideEncryption,
+    upload_limit: BoundedCounter,
+}
+
+#[derive(Debug, Clone)]
+pub struct UploaderConfig {
+    /// Storage class to be used for new object uploads
+    pub storage_class: Option<String>,
+    /// Server side encryption configuration to be used when creating new S3 object
+    pub server_side_encryption: ServerSideEncryption,
+    /// Maximum number of concurrent uploads
+    pub upload_limit: usize,
+}
+
+impl Default for UploaderConfig {
+    fn default() -> Self {
+        Self {
+            storage_class: None,
+            server_side_encryption: Default::default(),
+            upload_limit: 200,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -35,21 +53,19 @@ pub enum UploadPutError<S, C> {
     ClientError(#[from] ObjectClientError<S, C>),
     #[error("SSE settings corrupted")]
     SseCorruptedError(#[from] SseCorruptedError),
+    #[error("too many concurrent uploads ({0})")]
+    TooManyConcurrentUploads(usize),
 }
 
 impl<Client: ObjectClient> Uploader<Client> {
     /// Create a new [Uploader] that will make requests to the given client.
-    pub fn new(
-        client: Arc<Client>,
-        storage_class: Option<String>,
-        server_side_encryption: ServerSideEncryption,
-    ) -> Self {
-        let inner = UploaderInner {
+    pub fn new(client: Arc<Client>, config: UploaderConfig) -> Self {
+        Self {
             client,
-            storage_class,
-            server_side_encryption,
-        };
-        Self { inner: Arc::new(inner) }
+            storage_class: config.storage_class,
+            server_side_encryption: config.server_side_encryption,
+            upload_limit: BoundedCounter::new(config.upload_limit),
+        }
     }
 
     /// Start a new put request to the specified object.
@@ -58,15 +74,12 @@ impl<Client: ObjectClient> Uploader<Client> {
         bucket: &str,
         key: &str,
     ) -> Result<UploadRequest<Client>, UploadPutError<PutObjectError, Client::ClientError>> {
-        UploadRequest::new(Arc::clone(&self.inner), bucket, key).await
+        UploadRequest::new(self, bucket, key).await
     }
 
     #[cfg(test)]
     pub fn corrupt_sse(&mut self, sse_type: Option<String>, sse_kms_key_id: Option<String>) {
-        std::sync::Arc::get_mut(&mut self.inner)
-            .unwrap()
-            .server_side_encryption
-            .corrupt_data(sse_type, sse_kms_key_id)
+        self.server_side_encryption.corrupt_data(sse_type, sse_kms_key_id)
     }
 }
 
@@ -93,29 +106,34 @@ pub struct UploadRequest<Client: ObjectClient> {
     request: Client::PutObjectRequest,
     maximum_upload_size: Option<usize>,
     sse: ServerSideEncryption,
+    _token: CounterToken,
 }
 
 impl<Client: ObjectClient> UploadRequest<Client> {
     async fn new(
-        inner: Arc<UploaderInner<Client>>,
+        uploader: &Uploader<Client>,
         bucket: &str,
         key: &str,
     ) -> Result<UploadRequest<Client>, UploadPutError<PutObjectError, Client::ClientError>> {
-        let mut params = PutObjectParams::new().trailing_checksums(true);
+        let token = uploader
+            .upload_limit
+            .increment()
+            .map_err(UploadPutError::TooManyConcurrentUploads)?;
 
-        if let Some(storage_class) = &inner.storage_class {
+        let mut params = PutObjectParams::new().trailing_checksums(true);
+        if let Some(storage_class) = &uploader.storage_class {
             params = params.storage_class(storage_class.clone());
         }
         // If we have detected corruption of SSE settings, we return an error, which will currently be reported as
         // `libc::EIO` on `open()`. MP won't be able to open files for write from this point, but this is a relatively
         // low-risk error as data can not be uploaded with wrong SSE settings yet. Thus there is no strong reason for
         // MP to crash and it may continue serving read's.
-        let (sse_type, key_id) = inner.server_side_encryption.clone().into_inner()?;
+        let (sse_type, key_id) = uploader.server_side_encryption.clone().into_inner()?;
         params = params.server_side_encryption(sse_type);
         params = params.ssekms_key_id(key_id);
 
-        let request = inner.client.put_object(bucket, key, &params).await?;
-        let maximum_upload_size = inner.client.part_size().map(|ps| ps * MAX_S3_MULTIPART_UPLOAD_PARTS);
+        let request = uploader.client.put_object(bucket, key, &params).await?;
+        let maximum_upload_size = uploader.client.part_size().map(|ps| ps * MAX_S3_MULTIPART_UPLOAD_PARTS);
 
         Ok(Self {
             bucket: bucket.to_owned(),
@@ -124,7 +142,8 @@ impl<Client: ObjectClient> UploadRequest<Client> {
             hasher: Hasher::new(),
             request,
             maximum_upload_size,
-            sse: inner.server_side_encryption.clone(),
+            sse: uploader.server_side_encryption.clone(),
+            _token: token,
         })
     }
 
@@ -253,7 +272,7 @@ mod tests {
             part_size: 32,
             ..Default::default()
         }));
-        let uploader = Uploader::new(client.clone(), None, ServerSideEncryption::default());
+        let uploader = Uploader::new(client.clone(), Default::default());
         let request = uploader.put(bucket, key).await.unwrap();
 
         assert!(!client.contains_key(key));
@@ -279,8 +298,10 @@ mod tests {
         }));
         let uploader = Uploader::new(
             client.clone(),
-            Some(storage_class.to_owned()),
-            ServerSideEncryption::default(),
+            UploaderConfig {
+                storage_class: Some(storage_class.to_owned()),
+                ..Default::default()
+            },
         );
 
         let mut request = uploader.put(bucket, key).await.unwrap();
@@ -330,7 +351,7 @@ mod tests {
             put_failures,
         ));
 
-        let uploader = Uploader::new(failure_client.clone(), None, ServerSideEncryption::default());
+        let uploader = Uploader::new(failure_client.clone(), Default::default());
 
         // First request fails on first write.
         {
@@ -371,7 +392,7 @@ mod tests {
             part_size: PART_SIZE,
             ..Default::default()
         }));
-        let uploader = Uploader::new(client.clone(), None, ServerSideEncryption::default());
+        let uploader = Uploader::new(client.clone(), Default::default());
         let mut request = uploader.put(bucket, key).await.unwrap();
 
         let successful_writes = PART_SIZE * MAX_S3_MULTIPART_UPLOAD_PARTS / write_size;
@@ -402,11 +423,15 @@ mod tests {
         let client = Arc::new(MockClient::new(Default::default()));
         let mut uploader = Uploader::new(
             client,
-            None,
-            ServerSideEncryption::new(Some("aws:kms".to_string()), Some("some_key_alias".to_string())),
+            UploaderConfig {
+                server_side_encryption: ServerSideEncryption::new(
+                    Some("aws:kms".to_string()),
+                    Some("some_key_alias".to_string()),
+                ),
+                ..Default::default()
+            },
         );
-        std::sync::Arc::<UploaderInner<MockClient>>::get_mut(&mut uploader.inner)
-            .unwrap()
+        uploader
             .server_side_encryption
             .corrupt_data(sse_type_corrupted.map(String::from), key_id_corrupted.map(String::from));
         let err = uploader
@@ -432,9 +457,61 @@ mod tests {
         }));
         let uploader = Uploader::new(
             client,
-            None,
-            ServerSideEncryption::new(Some("aws:kms".to_string()), Some("some_key".to_string())),
+            UploaderConfig {
+                server_side_encryption: ServerSideEncryption::new(
+                    Some("aws:kms".to_string()),
+                    Some("some_key".to_string()),
+                ),
+                ..Default::default()
+            },
         );
         uploader.put(bucket, key).await.expect("put with sse should succeed");
+    }
+
+    #[test_case(20)]
+    #[test_case(200)]
+    #[tokio::test]
+    async fn max_uploads_test(upload_limit: usize) {
+        let bucket = "bucket";
+
+        let client = Arc::new(MockClient::new(MockClientConfig {
+            bucket: bucket.to_owned(),
+            part_size: 32,
+            ..Default::default()
+        }));
+        let uploader = Uploader::new(
+            client.clone(),
+            UploaderConfig {
+                upload_limit,
+                ..Default::default()
+            },
+        );
+
+        // Initiate enough requests to reach the limit.
+        let mut requests = Vec::new();
+        for i in 0..upload_limit {
+            let key = format!("key-{i}");
+            let request = uploader.put(bucket, &key).await.unwrap();
+            requests.push(request);
+        }
+
+        for request in &requests {
+            assert!(client.is_upload_in_progress(&request.key));
+        }
+
+        // Try to initate another request.
+        let error = uploader
+            .put(bucket, "other")
+            .await
+            .expect_err("should fail after reaching the limit");
+        assert!(matches!(error, UploadPutError::TooManyConcurrentUploads(count) if count == upload_limit));
+
+        // Abort one of the in-flight uploads.
+        drop(requests.pop().unwrap());
+
+        _ = uploader
+            .put(bucket, "other")
+            .await
+            .expect("should succeed after aborting another request");
     }
 }

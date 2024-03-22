@@ -26,6 +26,7 @@ use crate::sync::{Arc, AsyncMutex, AsyncRwLock};
 use crate::upload::{UploadRequest, Uploader};
 
 pub use crate::inode::InodeNo;
+pub use crate::upload::UploaderConfig;
 
 #[macro_use]
 mod error;
@@ -117,12 +118,8 @@ where
             .await
             .start_writing()?;
         let key = lookup.inode.full_key();
-        let handle = match fs.uploader.put(&fs.bucket, key).await {
-            Err(e) => {
-                return Err(err!(libc::EIO, source:e, "put failed to start"));
-            }
-            Ok(request) => FileHandleState::Write(UploadState::InProgress { request, handle }),
-        };
+        let request = fs.uploader.put(&fs.bucket, key).await?;
+        let handle = FileHandleState::Write(UploadState::InProgress { request, handle });
         metrics::gauge!("fs.current_handles", "type" => "write").increment(1.0);
         Ok(handle)
     }
@@ -352,12 +349,10 @@ pub struct S3FilesystemConfig {
     pub allow_delete: bool,
     /// Allow overwrite
     pub allow_overwrite: bool,
-    /// Storage class to be used for new object uploads
-    pub storage_class: Option<String>,
     /// S3 personality (for different S3 semantics)
     pub s3_personality: S3Personality,
-    /// Server side encryption configuration to be used when creating new S3 object
-    pub server_side_encryption: ServerSideEncryption,
+    /// Uploader config
+    pub uploader_config: UploaderConfig,
 }
 
 impl Default for S3FilesystemConfig {
@@ -374,9 +369,8 @@ impl Default for S3FilesystemConfig {
             file_mode: 0o644,
             allow_delete: false,
             allow_overwrite: false,
-            storage_class: None,
             s3_personality: S3Personality::Standard,
-            server_side_encryption: Default::default(),
+            uploader_config: Default::default(),
         }
     }
 }
@@ -544,11 +538,7 @@ where
 
         let client = Arc::new(client);
 
-        let uploader = Uploader::new(
-            client.clone(),
-            config.storage_class.to_owned(),
-            config.server_side_encryption.clone(),
-        );
+        let uploader = Uploader::new(client.clone(), config.uploader_config.clone());
 
         Self {
             config,
@@ -1353,7 +1343,10 @@ mod tests {
         let server_side_encryption =
             ServerSideEncryption::new(Some("aws:kms".to_owned()), Some("some_key_alias".to_owned()));
         let fs_config = S3FilesystemConfig {
-            server_side_encryption,
+            uploader_config: UploaderConfig {
+                server_side_encryption,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut fs = S3Filesystem::new(client, prefetcher, bucket, &Default::default(), fs_config);
