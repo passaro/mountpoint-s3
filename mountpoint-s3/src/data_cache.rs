@@ -7,6 +7,7 @@
 mod cache_directory;
 mod disk_data_cache;
 mod in_memory_data_cache;
+mod xoz_data_cache;
 
 use thiserror::Error;
 
@@ -14,6 +15,7 @@ pub use crate::checksums::ChecksummedBytes;
 pub use crate::data_cache::cache_directory::ManagedCacheDir;
 pub use crate::data_cache::disk_data_cache::{CacheLimit, DiskDataCache, DiskDataCacheConfig};
 pub use crate::data_cache::in_memory_data_cache::InMemoryDataCache;
+pub use crate::data_cache::xoz_data_cache::XozDataCache;
 
 use crate::object::ObjectId;
 

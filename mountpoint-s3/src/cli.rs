@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::os::unix::prelude::FromRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
@@ -26,7 +27,7 @@ use nix::unistd::ForkResult;
 use regex::Regex;
 
 use crate::build_info;
-use crate::data_cache::{CacheLimit, DiskDataCache, DiskDataCacheConfig, ManagedCacheDir};
+use crate::data_cache::{CacheLimit, DiskDataCache, DiskDataCacheConfig, ManagedCacheDir, XozDataCache};
 use crate::fs::{CacheConfig, S3FilesystemConfig, ServerSideEncryption, TimeToLive};
 use crate::fuse::session::FuseSession;
 use crate::fuse::S3FuseFilesystem;
@@ -281,6 +282,15 @@ pub struct CliArgs {
         requires = "cache",
     )]
     pub max_cache_size: Option<u64>,
+
+    #[clap(
+        long,
+        help = "Enable caching of object metadata and content to the specified xoz bucket (same region only)",
+        help_heading = CACHING_OPTIONS_HEADER,
+        value_name = "BUCKET",
+        value_parser = parse_bucket_name,
+    )]
+    pub cache_xoz: Option<String>,
 
     #[clap(
         long,
@@ -760,7 +770,9 @@ where
         if let Some(cache_config) = cache_config {
             let managed_cache_dir =
                 ManagedCacheDir::new_from_parent(path).context("failed to create cache directory")?;
+
             let cache = DiskDataCache::new(managed_cache_dir.as_path_buf(), cache_config);
+
             let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
             let mut fuse_session = create_filesystem(
                 client,
@@ -779,6 +791,24 @@ where
             return Ok(fuse_session);
         }
     }
+
+    if let Some(xoz_bucket_name) = args.cache_xoz {
+        let client = Arc::new(client);
+        let cache = XozDataCache::new(&xoz_bucket_name, client.clone());
+
+        let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
+        let fuse_session = create_filesystem(
+            client.clone(),
+            prefetcher,
+            &args.bucket_name,
+            &args.prefix.unwrap_or_default(),
+            filesystem_config,
+            fuse_config,
+            &bucket_description,
+        )?;
+
+        return Ok(fuse_session);
+    };
 
     let prefetcher = default_prefetch(runtime, prefetcher_config);
     create_filesystem(
