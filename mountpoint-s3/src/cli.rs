@@ -5,7 +5,6 @@ use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::os::unix::prelude::FromRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
@@ -793,15 +792,27 @@ where
     }
 
     if let Some(xoz_bucket_name) = args.cache_xoz {
-        let client = Arc::new(client);
-        let cache = XozDataCache::new(&xoz_bucket_name, client.clone());
+        // When using the same CRT client, it was hanging, see https://t.corp.amazon.com/D132039029/communication.
+        // So we create a new client for the xoz cache.
+        let new_args = CliArgs {
+            bucket_name: xoz_bucket_name.clone(),
+            storage_class: None,
+            sse: None,
+            sse_kms_key_id: None,
+            cache: None,
+            cache_xoz: None, // nothing is going to need this value anymore
+            ..args
+        };
+        let (xoz_client, _runtime, _personality) =
+            create_s3_client(&new_args).expect("could not create s3 client for xoz cache");
+        let cache = XozDataCache::new(&xoz_bucket_name, xoz_client);
 
         let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
         let fuse_session = create_filesystem(
-            client.clone(),
+            client,
             prefetcher,
             &args.bucket_name,
-            &args.prefix.unwrap_or_default(),
+            &new_args.prefix.unwrap_or_default(),
             filesystem_config,
             fuse_config,
             &bucket_description,
