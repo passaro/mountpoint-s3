@@ -14,15 +14,17 @@ const CACHE_VERSION: &str = "V1";
 pub struct XozDataCache<Client: ObjectClient> {
     bucket_name: String,
     client: Client,
+    block_size: u64,
 }
 impl<Client> XozDataCache<Client>
 where
     Client: ObjectClient + Send + Sync + 'static,
 {
-    pub fn new(bucket_name: &str, client: Client) -> Self {
+    pub fn new(bucket_name: &str, client: Client, block_size: Option<u64>) -> Self {
         Self {
             client,
             bucket_name: bucket_name.to_owned(),
+            block_size: block_size.unwrap_or(1) * 1024 * 1024,
         }
     }
 
@@ -104,7 +106,7 @@ where
     }
 
     fn block_size(&self) -> u64 {
-        1024 * 1024
+        self.block_size
     }
 }
 
