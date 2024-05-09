@@ -284,12 +284,21 @@ pub struct CliArgs {
 
     #[clap(
         long,
-        help = "Enable caching of object metadata and content to the specified xoz bucket (same region only)",
+        help = "Enable caching of object content to the specified xoz bucket (same region only)",
         help_heading = CACHING_OPTIONS_HEADER,
         value_name = "BUCKET",
         value_parser = parse_bucket_name,
     )]
     pub cache_xoz: Option<String>,
+
+    #[clap(
+        long,
+        help = "When caching to xoz, how big each cache block should be in MiB",
+        help_heading = CACHING_OPTIONS_HEADER,
+        value_name = "MiB",
+        requires = "cache_xoz"
+    )]
+    pub cache_xoz_block_size: Option<u64>,
 
     #[clap(
         long,
@@ -805,7 +814,7 @@ where
         };
         let (xoz_client, _runtime, _personality) =
             create_s3_client(&new_args).expect("could not create s3 client for xoz cache");
-        let cache = XozDataCache::new(&xoz_bucket_name, xoz_client);
+        let cache = XozDataCache::new(&xoz_bucket_name, xoz_client, new_args.cache_xoz_block_size);
 
         let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
         let fuse_session = create_filesystem(
