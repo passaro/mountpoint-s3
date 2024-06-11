@@ -78,6 +78,7 @@ built = { version = "0.7.1", features = ["git2"] }
 
 [features]
 # Unreleased feature flags
+multi_channels = []
 
 # Features for choosing tests
 fips_tests = []
