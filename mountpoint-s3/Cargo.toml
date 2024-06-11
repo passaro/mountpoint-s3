@@ -78,7 +78,7 @@ built = { version = "0.7.1", features = ["git2"] }
 
 [features]
 # Unreleased feature flags
-negative_cache = []
+
 # Features for choosing tests
 fips_tests = []
 fuse_tests = []
