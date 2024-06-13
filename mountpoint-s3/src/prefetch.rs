@@ -153,7 +153,7 @@ impl Default for PrefetcherConfig {
 }
 
 /// A [Prefetcher] creates and manages prefetching GetObject requests to objects.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Prefetcher<Stream> {
     part_stream: Arc<Stream>,
     config: PrefetcherConfig,

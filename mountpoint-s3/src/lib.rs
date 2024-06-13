@@ -1,5 +1,6 @@
 pub mod autoconfigure;
 mod build_info;
+pub mod channel;
 mod checksums;
 pub mod cli;
 pub mod data_cache;

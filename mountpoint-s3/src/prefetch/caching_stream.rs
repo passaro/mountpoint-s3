@@ -18,7 +18,7 @@ use crate::prefetch::PrefetchReadError;
 
 /// [ObjectPartStream] implementation which maintains a [DataCache] for the object data
 /// retrieved by an [ObjectClient].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CachingPartStream<Cache, Runtime> {
     cache: Arc<Cache>,
     runtime: Runtime,

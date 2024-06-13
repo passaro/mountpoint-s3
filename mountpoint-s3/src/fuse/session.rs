@@ -19,7 +19,7 @@ pub struct FuseSession {
     on_close: Vec<OnClose>,
 }
 
-type OnClose = Box<dyn FnOnce()>;
+type OnClose = Box<dyn FnOnce() + Send>;
 
 impl FuseSession {
     /// Create worker threads to dispatch requests for a FUSE session.
@@ -67,10 +67,14 @@ impl FuseSession {
                 .context("failed to spawn waiter thread")?
         };
 
-        ctrlc::set_handler(move || {
+        // TODO: decide how to set this up
+        let result = ctrlc::try_set_handler(move || {
             let _ = tx.send(Message::Interrupted);
-        })
-        .context("failed to set interrupt handler")?;
+        });
+        match result {
+            Err(ctrlc::Error::MultipleHandlers) => {}
+            _ => result.context("failed to set interrupt handler")?,
+        }
 
         WorkerPool::start(session, workers_tx, max_worker_threads).context("failed to start worker thread pool")?;
 

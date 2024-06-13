@@ -365,7 +365,7 @@ impl CacheConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct S3FilesystemConfig {
     /// Kernel cache config
     pub cache_config: CacheConfig,

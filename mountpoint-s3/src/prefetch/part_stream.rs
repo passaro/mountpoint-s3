@@ -145,7 +145,7 @@ impl Debug for RequestRange {
 }
 
 /// [ObjectPartStream] implementation which delegates retrieving object data to a [Client].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClientPartStream<Runtime> {
     runtime: Runtime,
 }

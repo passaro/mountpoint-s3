@@ -36,7 +36,7 @@ pub struct DiskDataCache {
 }
 
 /// Configuration for a [DiskDataCache].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DiskDataCacheConfig {
     /// Size of data blocks.
     pub block_size: u64,
@@ -54,7 +54,7 @@ impl Default for DiskDataCacheConfig {
 }
 
 /// Limit the cache size.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum CacheLimit {
     Unbounded,
     TotalSize { max_size: usize },

@@ -1,11 +1,13 @@
-use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::os::unix::prelude::FromRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::time::Duration;
+use std::{env, thread};
 
 use anyhow::{anyhow, Context as _};
 use clap::{value_parser, Parser, ValueEnum};
@@ -25,16 +27,18 @@ use nix::sys::signal::Signal;
 use nix::unistd::ForkResult;
 use regex::Regex;
 
+use crate::autoconfigure;
 use crate::build_info;
+use crate::channel::{Channel, ChannelConfig};
 use crate::data_cache::{CacheLimit, DiskDataCache, DiskDataCacheConfig, ManagedCacheDir};
 use crate::fs::{CacheConfig, S3FilesystemConfig, ServerSideEncryption, TimeToLive};
 use crate::fuse::session::FuseSession;
 use crate::fuse::S3FuseFilesystem;
 use crate::logging::{init_logging, LoggingConfig};
+use crate::metrics;
 use crate::prefetch::{caching_prefetch, default_prefetch, Prefetch};
 use crate::prefix::Prefix;
 use crate::s3::S3Personality;
-use crate::{autoconfigure, metrics};
 
 const CLIENT_OPTIONS_HEADER: &str = "Client options";
 const MOUNT_OPTIONS_HEADER: &str = "Mount options";
@@ -59,6 +63,16 @@ pub struct CliArgs {
         help_heading = BUCKET_OPTIONS_HEADER
     )]
     pub prefix: Option<Prefix>,
+
+    #[cfg(feature = "multi_channels")]
+    #[clap(
+        long = "channel",
+        value_name = "NAME:PREFIX",
+        help = "Configure one or more channels",
+        help_heading = BUCKET_OPTIONS_HEADER,
+        conflicts_with = "prefix",
+    )]
+    pub channels: Vec<ChannelConfig>,
 
     #[clap(
         long,
@@ -352,7 +366,14 @@ impl CliArgs {
     }
 
     fn prefix(&self) -> Prefix {
-        self.prefix.as_ref().cloned().unwrap_or_default()
+        let mut prefix = self.prefix.as_ref().cloned();
+
+        #[cfg(feature = "multi_channels")]
+        {
+            prefix = prefix.or_else(|| self.channels.first().map(|channel| channel.prefix.clone()));
+        }
+
+        prefix.unwrap_or_default()
     }
 
     fn logging_config(&self) -> LoggingConfig {
@@ -416,32 +437,93 @@ impl CliArgs {
             max_threads,
         }
     }
+
+    fn successful_mount_msg(&self) -> String {
+        #[cfg(feature = "multi_channels")]
+        if !self.channels.is_empty() {
+            let mut msg = format!("Channels mounted under {}:", self.mount_point.display());
+            for channel in &self.channels {
+                msg.push_str(&format!("\n{}: {}", channel.name, channel.prefix));
+            }
+            return msg;
+        }
+
+        format!(
+            "{} is mounted at {}",
+            self.bucket_description(),
+            self.mount_point.display()
+        )
+    }
+
+    fn channels(&self) -> Vec<Channel> {
+        #[cfg(feature = "multi_channels")]
+        if !self.channels.is_empty() {
+            return self
+                .channels
+                .iter()
+                .map(|def| {
+                    let mount_point = self.mount_point.join(&def.name);
+                    Channel {
+                        mount_point,
+                        bucket: self.bucket_name.clone(),
+                        prefix: def.prefix.clone(),
+                    }
+                })
+                .collect();
+        }
+
+        vec![Channel {
+            mount_point: self.mount_point.clone(),
+            bucket: self.bucket_name.clone(),
+            prefix: self.prefix(),
+        }]
+    }
+}
+
+struct Mount {
+    channels: Vec<(Channel, FuseSession)>,
+}
+
+impl Mount {
+    fn join(mut self) -> Receiver<anyhow::Result<()>> {
+        let (sender, receiver) = mpsc::channel();
+        if self.channels.len() == 1 {
+            let (_, session) = self.channels.pop().unwrap();
+            sender.send(session.join()).unwrap();
+        } else {
+            for (_, session) in self.channels {
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    sender.send(session.join()).unwrap();
+                });
+            }
+        }
+        receiver
+    }
 }
 
 pub fn main<ClientBuilder, Client, Runtime>(client_builder: ClientBuilder) -> anyhow::Result<()>
 where
     ClientBuilder: FnOnce(&CliArgs) -> anyhow::Result<(Client, Runtime, S3Personality)>,
     Client: ObjectClient + Send + Sync + 'static,
-    Runtime: Spawn + Send + Sync + 'static,
+    Runtime: Spawn + Clone + Send + Sync + 'static,
 {
     let args = CliArgs::parse();
-    let successful_mount_msg = format!(
-        "{} is mounted at {}",
-        args.bucket_description(),
-        args.mount_point.display()
-    );
-
     if args.foreground {
         init_logging(args.logging_config()).context("failed to initialize logging")?;
 
         let _metrics = metrics::install();
 
         // mount file system as a foreground process
-        let session = mount(args, client_builder)?;
+        let mount = mount(&args, client_builder)?;
 
-        println!("{successful_mount_msg}");
+        println!("{}", args.successful_mount_msg());
 
-        session.join().context("failed to join session")?;
+        for result in mount.join().iter() {
+            if let Err(e) = result {
+                tracing::error!("Failed to join fuse session: {:?}", e);
+            }
+        }
     } else {
         // mount file system as a background process
 
@@ -463,7 +545,7 @@ where
 
                 let _metrics = metrics::install();
 
-                let session = mount(args, client_builder);
+                let mount = mount(&args, client_builder);
 
                 // close unused file descriptor, we only write from this end.
                 nix::unistd::close(read_fd).context("Failed to close unused file descriptor")?;
@@ -474,8 +556,8 @@ where
                 let status_success = [b'0'];
                 let status_failure = [b'1'];
 
-                match session {
-                    Ok(session) => {
+                match mount {
+                    Ok(mount) => {
                         pipe_file
                             .write(&status_success)
                             .context("Failed to write data to the pipe")?;
@@ -487,7 +569,11 @@ where
                         nix::unistd::close(std::io::stdout().as_raw_fd()).context("couldn't close stdout")?;
                         nix::unistd::close(std::io::stderr().as_raw_fd()).context("couldn't close stderr")?;
 
-                        session.join().context("failed to join session")?;
+                        for result in mount.join().iter() {
+                            if let Err(e) = result {
+                                tracing::error!("Failed to join fuse session: {:?}", e);
+                            }
+                        }
                     }
                     Err(e) => {
                         pipe_file
@@ -532,7 +618,7 @@ where
                 let status = receiver.recv_timeout(timeout);
                 match status {
                     Ok('0') => {
-                        println!("{successful_mount_msg}");
+                        println!("{}", args.successful_mount_msg());
                         tracing::debug!("success status flag received from child process")
                     }
                     Ok(_) => {
@@ -643,19 +729,19 @@ pub fn create_s3_client(args: &CliArgs) -> anyhow::Result<(S3CrtClient, EventLoo
     Ok((client, runtime, s3_personality))
 }
 
-fn mount<ClientBuilder, Client, Runtime>(args: CliArgs, client_builder: ClientBuilder) -> anyhow::Result<FuseSession>
+fn mount<ClientBuilder, Client, Runtime>(args: &CliArgs, client_builder: ClientBuilder) -> anyhow::Result<Mount>
 where
     ClientBuilder: FnOnce(&CliArgs) -> anyhow::Result<(Client, Runtime, S3Personality)>,
     Client: ObjectClient + Send + Sync + 'static,
-    Runtime: Spawn + Send + Sync + 'static,
+    Runtime: Spawn + Clone + Send + Sync + 'static,
 {
     tracing::info!("mount-s3 {}", build_info::FULL_VERSION);
     tracing::debug!("{:?}", args);
 
-    validate_mount_point(&args.mount_point)?;
+    validate_mount_point(&args.mount_point, false)?;
     validate_sse_args(args.sse.as_deref(), args.sse_kms_key_id.as_deref())?;
 
-    let (client, runtime, s3_personality) = client_builder(&args)?;
+    let (client, runtime, s3_personality) = client_builder(args)?;
 
     let bucket_description = args.bucket_description();
     tracing::debug!("using S3 personality {s3_personality:?} for {bucket_description}");
@@ -675,11 +761,11 @@ where
     if let Some(file_mode) = args.file_mode {
         filesystem_config.file_mode = file_mode;
     }
-    filesystem_config.storage_class = args.storage_class;
+    filesystem_config.storage_class.clone_from(&args.storage_class);
     filesystem_config.allow_delete = args.allow_delete;
     filesystem_config.allow_overwrite = args.allow_overwrite;
     filesystem_config.s3_personality = s3_personality;
-    filesystem_config.server_side_encryption = ServerSideEncryption::new(args.sse, args.sse_kms_key_id);
+    filesystem_config.server_side_encryption = ServerSideEncryption::new(args.sse.clone(), args.sse_kms_key_id.clone());
 
     // Written in this awkward way to force us to update it if we add new checksum types
     filesystem_config.use_upload_checksums = match args.upload_checksums {
@@ -717,7 +803,9 @@ where
     }
     filesystem_config.cache_config = CacheConfig::new(metadata_cache_ttl);
 
-    if let Some(path) = args.cache {
+    let client = Arc::new(client);
+
+    if let Some(path) = &args.cache {
         let cache_config = match args.max_cache_size {
             // Fallback to no data cache.
             Some(0) => None,
@@ -732,37 +820,58 @@ where
 
         if let Some(cache_config) = cache_config {
             let managed_cache_dir =
-                ManagedCacheDir::new_from_parent(path).context("failed to create cache directory")?;
-            let cache = DiskDataCache::new(managed_cache_dir.as_path_buf(), cache_config);
-            let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
-            let mut fuse_session = create_filesystem(
-                client,
-                prefetcher,
-                &args.bucket_name,
-                &args.prefix.unwrap_or_default(),
-                filesystem_config,
-                fuse_config,
-                &bucket_description,
-            )?;
+                Arc::new(ManagedCacheDir::new_from_parent(path).context("failed to create cache directory")?);
 
-            fuse_session.run_on_close(Box::new(move || {
-                drop(managed_cache_dir);
-            }));
+            let mut channels = Vec::new();
+            for channel in args.channels() {
+                // TODO: unified cache?
+                let cache = DiskDataCache::new(managed_cache_dir.as_path_buf(), cache_config.clone());
+                let prefetcher = caching_prefetch(cache, runtime.clone(), prefetcher_config);
+                validate_mount_point(&channel.mount_point, true)?;
 
-            return Ok(fuse_session);
+                let mut fuse_config = fuse_config.clone();
+                fuse_config.mount_point.clone_from(&channel.mount_point);
+
+                let mut fuse_session = create_filesystem(
+                    client.clone(),
+                    prefetcher,
+                    &channel.bucket,
+                    &channel.prefix,
+                    filesystem_config.clone(),
+                    fuse_config,
+                    &bucket_description,
+                )?;
+
+                let managed_cache_dir = managed_cache_dir.clone();
+                fuse_session.run_on_close(Box::new(move || {
+                    drop(managed_cache_dir);
+                }));
+                channels.push((channel, fuse_session));
+            }
+            return Ok(Mount { channels });
         }
     }
 
     let prefetcher = default_prefetch(runtime, prefetcher_config);
-    create_filesystem(
-        client,
-        prefetcher,
-        &args.bucket_name,
-        &args.prefix.unwrap_or_default(),
-        filesystem_config,
-        fuse_config,
-        &bucket_description,
-    )
+    let mut channels = Vec::new();
+    for channel in args.channels() {
+        validate_mount_point(&channel.mount_point, true)?;
+
+        let mut fuse_config = fuse_config.clone();
+        fuse_config.mount_point.clone_from(&channel.mount_point);
+
+        let fuse_session = create_filesystem(
+            client.clone(),
+            prefetcher.clone(),
+            &channel.bucket,
+            &channel.prefix,
+            filesystem_config.clone(),
+            fuse_config.clone(),
+            &bucket_description,
+        )?;
+        channels.push((channel, fuse_session));
+    }
+    Ok(Mount { channels })
 }
 
 fn create_filesystem<Client, Prefetcher>(
@@ -793,7 +902,7 @@ where
 }
 
 /// Configuration for a FUSE background session.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FuseSessionConfig {
     pub mount_point: PathBuf,
     pub options: Vec<MountOption>,
@@ -954,11 +1063,15 @@ fn infer_s3_personality(
     }
 }
 
-fn validate_mount_point(path: impl AsRef<Path>) -> anyhow::Result<()> {
+fn validate_mount_point(path: impl AsRef<Path>, create_if_needed: bool) -> anyhow::Result<()> {
     let mount_point = path.as_ref();
 
     if !mount_point.exists() {
-        return Err(anyhow!("mount point {} does not exist", mount_point.display()));
+        if !create_if_needed || !mount_point.parent().map(|p| p.exists()).unwrap_or_default() {
+            return Err(anyhow!("mount point {} does not exist", mount_point.display()));
+        }
+        fs::create_dir(mount_point)
+            .with_context(|| format!("failed to create mount point sub-directory {}", mount_point.display()))?;
     }
 
     if !mount_point.is_dir() {
