@@ -4,7 +4,7 @@ use std::{ops::Range, sync::Arc};
 use async_channel::{unbounded, Receiver};
 use bytes::Bytes;
 use futures::task::{Spawn, SpawnExt};
-use futures::{join, pin_mut, StreamExt};
+use futures::{join, pin_mut, Stream, StreamExt};
 use mountpoint_s3_client::{types::ETag, ObjectClient};
 use tracing::{debug_span, trace, warn, Instrument};
 
@@ -165,23 +165,21 @@ where
             "fetching data from client"
         );
 
-        let (body_sender, body_receiver) = unbounded();
-        let request_reader_future = read_from_request(
-            body_sender,
+        let request_stream = read_from_request(
             self.client.clone(),
             self.bucket.clone(),
             self.cache_key.clone(),
             block_aligned_byte_range,
         );
         let part_composer_future = compose_parts(
-            body_receiver,
+            request_stream,
             part_queue_producer,
             self.cache_key.clone(),
             range,
             block_range,
             self.cache.clone(),
         );
-        join!(request_reader_future, part_composer_future);
+        part_composer_future.await;
     }
 
     fn block_indices_for_byte_range(&self, range: &RequestRange) -> Range<BlockIndex> {
@@ -197,7 +195,7 @@ where
 }
 
 async fn compose_parts<E, Cache>(
-    body_receiver: Receiver<RequestReaderOutput<E>>,
+    body_receiver: impl Stream<Item = RequestReaderOutput<E>>,
     part_queue_producer: PartQueueProducer<E>,
     object_id: ObjectId,
     range: RequestRange,

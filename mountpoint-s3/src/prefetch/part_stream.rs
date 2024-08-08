@@ -1,6 +1,8 @@
 use async_channel::{unbounded, Receiver, Sender};
+use async_stream::try_stream;
 use bytes::Bytes;
 use futures::task::SpawnExt;
+use futures::Stream;
 use futures::{join, pin_mut, task::Spawn, StreamExt};
 use mountpoint_s3_client::{types::ETag, ObjectClient};
 use std::marker::{Send, Sync};
@@ -195,12 +197,10 @@ where
             .spawn_with_handle(
                 async move {
                     let object_id = ObjectId::new(key, if_match);
-                    let (body_sender, body_receiver) = unbounded();
-                    let request_reader_future =
-                        read_from_request(body_sender, client, bucket, object_id.clone(), request_range.into());
+                    let request_stream = read_from_request(client, bucket, object_id.clone(), request_range.into());
                     let part_composer_future =
-                        compose_parts(body_receiver, part_queue_producer, object_id, preferred_part_size);
-                    join!(request_reader_future, part_composer_future);
+                        compose_parts(request_stream, part_queue_producer, object_id, preferred_part_size);
+                    part_composer_future.await;
                 }
                 .instrument(span),
             )
@@ -215,61 +215,33 @@ where
 /// sending part of the channel and returns. After this the receiving part of the channel will still
 /// be able to receive pending chunks. If the receiving part of the channel is closed before the request
 /// was finished, future completes itself early canceling the request.
-pub async fn read_from_request<Client: ObjectClient>(
-    body_sender: Sender<RequestReaderOutput<Client::ClientError>>,
+pub fn read_from_request<Client: ObjectClient>(
     client: Client,
     bucket: String,
     id: ObjectId,
     request_range: Range<u64>,
-) {
-    let get_object_result = match client
-        .get_object(&bucket, id.key(), Some(request_range), Some(id.etag().clone()))
-        .await
-    {
-        Ok(get_object_result) => get_object_result,
-        Err(e) => {
-            error!(key=id.key(), error=?e, "GetObject request failed");
-            if body_sender
-                .send(Err(PrefetchReadError::GetRequestFailed(e)))
-                .await
-                .is_err()
-            {
-                trace!("body channel closed");
-            }
-            return;
-        }
-    };
+) -> impl Stream<Item = RequestReaderOutput<Client::ClientError>> {
+    try_stream! {
+        let get_object_result = client
+            .get_object(&bucket, id.key(), Some(request_range), Some(id.etag().clone()))
+            .await
+            .inspect_err(|e| error!(key=id.key(), error=?e, "GetObject request failed"))
+            .map_err(|e| PrefetchReadError::GetRequestFailed(e))?;
 
-    pin_mut!(get_object_result);
-    loop {
-        match get_object_result.next().await {
-            Some(Ok((offset, body))) => {
-                trace!(offset, length = body.len(), "received GetObject part");
-                metrics::counter!("s3.client.total_bytes", "type" => "read").increment(body.len() as u64);
-                if body_sender.send(Ok((offset, body))).await.is_err() {
-                    trace!("body channel closed");
-                    break;
-                }
-            }
-            Some(Err(e)) => {
-                error!(key=id.key(), error=?e, "GetObject body part failed");
-                if body_sender
-                    .send(Err(PrefetchReadError::GetRequestFailed(e)))
-                    .await
-                    .is_err()
-                {
-                    trace!("body channel closed");
-                }
-                break;
-            }
-            None => break,
+        for await chunk in get_object_result {
+            let (offset, body) = chunk
+                .inspect_err(|e| error!(key=id.key(), error=?e, "GetObject body part failed"))
+                .map_err(|e| PrefetchReadError::GetRequestFailed(e))?;
+            trace!(offset, length = body.len(), "received GetObject part");
+            metrics::counter!("s3.client.total_bytes", "type" => "read").increment(body.len() as u64);
+            yield (offset, body);
         }
+        trace!("request finished");
     }
-    trace!("request finished");
 }
 
 async fn compose_parts<E: std::error::Error + Send + Sync>(
-    body_receiver: Receiver<RequestReaderOutput<E>>,
+    body_receiver: impl Stream<Item = RequestReaderOutput<E>>,
     part_queue_producer: PartQueueProducer<E>,
     object_id: ObjectId,
     preferred_part_size: usize,
