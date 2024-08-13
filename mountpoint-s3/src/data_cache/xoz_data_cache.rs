@@ -89,7 +89,7 @@ where
         block_idx: BlockIndex,
         _block_offset: u64, // TODO: should we use this?
     ) -> DataCacheResult<Option<ChecksummedBytes>> {
-        let object_key = object_key(&cache_key, block_idx);
+        let object_key = object_key(cache_key, block_idx);
 
         return futures::executor::block_on(self.get_block_xoz(object_key));
     }
