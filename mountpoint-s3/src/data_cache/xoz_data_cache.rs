@@ -24,7 +24,7 @@ where
         Self {
             client,
             bucket_name: bucket_name.to_owned(),
-            block_size: block_size.unwrap_or(1) * 1024 * 1024,
+            block_size: block_size.unwrap_or(1024) * 1024,
         }
     }
 

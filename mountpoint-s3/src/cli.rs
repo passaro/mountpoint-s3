@@ -261,6 +261,7 @@ pub struct CliArgs {
         help = "Enable caching of object content to the given directory and set metadata TTL to 60 seconds",
         help_heading = CACHING_OPTIONS_HEADER,
         value_name = "DIRECTORY",
+        group = "cache_group",
     )]
     pub cache: Option<PathBuf>,
 
@@ -288,17 +289,18 @@ pub struct CliArgs {
         help_heading = CACHING_OPTIONS_HEADER,
         value_name = "BUCKET",
         value_parser = parse_bucket_name,
+        group = "cache_group",
     )]
     pub cache_xoz: Option<String>,
 
     #[clap(
         long,
-        help = "When caching to xoz, how big each cache block should be in MiB",
+        help = "Size of a cache block in KiB [Default: 1024 (1 MiB)]",
         help_heading = CACHING_OPTIONS_HEADER,
-        value_name = "MiB",
-        requires = "cache_xoz"
+        value_name = "KiB",
+        requires = "cache_group"
     )]
-    pub cache_xoz_block_size: Option<u64>,
+    pub cache_block_size: Option<u64>,
 
     #[clap(
         long,
@@ -793,19 +795,20 @@ where
     filesystem_config.cache_config = CacheConfig::new(metadata_cache_ttl);
 
     if let Some(path) = args.cache {
-        let cache_config = match args.max_cache_size {
+        let cache_limit = match args.max_cache_size {
             // Fallback to no data cache.
             Some(0) => None,
-            Some(max_size_in_mib) => Some(DiskDataCacheConfig {
-                limit: CacheLimit::TotalSize {
-                    max_size: (max_size_in_mib * 1024 * 1024) as usize,
-                },
-                ..Default::default()
+            Some(max_size_in_mib) => Some(CacheLimit::TotalSize {
+                max_size: (max_size_in_mib * 1024 * 1024) as usize,
             }),
-            None => Some(DiskDataCacheConfig::default()),
+            None => Some(CacheLimit::default()),
         };
-
-        if let Some(cache_config) = cache_config {
+        if let Some(cache_limit) = cache_limit {
+            let block_size = args.cache_block_size.map(|kib| kib * 1024).unwrap_or(1024 * 1024); // 1 MiB block size
+            let cache_config = DiskDataCacheConfig {
+                block_size,
+                limit: cache_limit,
+            };
             let cache_key = env_unstable_cache_key();
             let managed_cache_dir = ManagedCacheDir::new_from_parent_with_cache_key(path, cache_key)
                 .context("failed to create cache directory")?;
@@ -845,7 +848,7 @@ where
         };
         let (xoz_client, _runtime, _personality) =
             create_s3_client(&new_args).expect("could not create s3 client for xoz cache");
-        let cache = XozDataCache::new(&xoz_bucket_name, xoz_client, new_args.cache_xoz_block_size);
+        let cache = XozDataCache::new(&xoz_bucket_name, xoz_client, new_args.cache_block_size);
 
         let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
         let fuse_session = create_filesystem(
