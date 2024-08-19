@@ -2,7 +2,7 @@ use crate::object::ObjectId;
 
 use super::{BlockIndex, ChecksummedBytes, DataCache, DataCacheResult};
 
-use bytes::Bytes;
+use bytes::BytesMut;
 use futures::{pin_mut, StreamExt};
 use mountpoint_s3_client::types::PutObjectParams;
 use mountpoint_s3_client::{ObjectClient, PutObjectRequest};
@@ -40,14 +40,13 @@ where
 
         pin_mut!(result);
 
-        let mut buffer = ChecksummedBytes::default();
+        let mut buffer = BytesMut::default();
         loop {
             warn!("get_block_xoz {}", object_key);
             match result.next().await {
                 Some(Ok((_offset, body))) => {
                     // TODO: check offset expectation
-                    let body: Bytes = body.into();
-                    buffer.extend(body.into()).expect("could not extend buffer");
+                    buffer.extend_from_slice(&body);
                 }
                 Some(Err(_e)) => {
                     // TODO: what should we do here? anything better?
@@ -58,8 +57,8 @@ where
                 }
             }
         }
-
-        DataCacheResult::Ok(Some(buffer))
+        let buffer = buffer.freeze();
+        DataCacheResult::Ok(Some(buffer.into()))
     }
 
     async fn put_block_xoz(&self, object_key: String, bytes: ChecksummedBytes) -> DataCacheResult<()> {
