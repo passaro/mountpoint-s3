@@ -61,6 +61,12 @@ pub enum CacheLimit {
     AvailableSpace { min_ratio: f64 },
 }
 
+impl Default for CacheLimit {
+    fn default() -> Self {
+        CacheLimit::AvailableSpace { min_ratio: 0.05 } // Preserve 5% available space
+    }
+}
+
 /// Describes additional information about the data stored in the block.
 ///
 /// It should be written alongside the block's data
