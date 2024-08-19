@@ -768,7 +768,7 @@ where
     let prefetcher_config = Default::default();
 
     let mut metadata_cache_ttl = args.metadata_ttl.unwrap_or_else(|| {
-        if args.cache.is_some() {
+        if args.cache.is_some() || args.cache_xoz.is_some() {
             // When the data cache is enabled, use 1min as metadata-ttl.
             TimeToLive::Duration(Duration::from_secs(60))
         } else {
