@@ -10,6 +10,8 @@
 //!
 //! This binary is intended only for use in testing and development of Mountpoint.
 
+use std::sync::Arc;
+
 use futures::executor::ThreadPool;
 use mountpoint_s3::cli::CliArgs;
 use mountpoint_s3::s3::S3Personality;
@@ -21,7 +23,7 @@ fn main() -> anyhow::Result<()> {
     mountpoint_s3::cli::main(create_mock_client)
 }
 
-fn create_mock_client(args: &CliArgs) -> anyhow::Result<(ThroughputMockClient, ThreadPool, S3Personality)> {
+fn create_mock_client(args: &CliArgs) -> anyhow::Result<(Arc<ThroughputMockClient>, ThreadPool, S3Personality)> {
     // An extra little safety thing to make sure we can distinguish the real mount-s3 binary and
     // this one. Buckets starting with "sthree-" are always invalid against real S3:
     // https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
@@ -74,5 +76,5 @@ fn create_mock_client(args: &CliArgs) -> anyhow::Result<(ThroughputMockClient, T
         MockObject::from_bytes(b"hello world", ETag::for_tests()),
     );
 
-    Ok((client, runtime, s3_personality))
+    Ok((Arc::new(client), runtime, s3_personality))
 }

@@ -471,7 +471,7 @@ impl CliArgs {
 pub fn main<ClientBuilder, Client, Runtime>(client_builder: ClientBuilder) -> anyhow::Result<()>
 where
     ClientBuilder: FnOnce(&CliArgs) -> anyhow::Result<(Client, Runtime, S3Personality)>,
-    Client: ObjectClient + Send + Sync + 'static,
+    Client: ObjectClient + Clone + Send + Sync + 'static,
     Runtime: Spawn + Send + Sync + 'static,
 {
     let args = CliArgs::parse();
@@ -722,7 +722,7 @@ pub fn create_s3_client(args: &CliArgs) -> anyhow::Result<(S3CrtClient, EventLoo
 fn mount<ClientBuilder, Client, Runtime>(args: CliArgs, client_builder: ClientBuilder) -> anyhow::Result<FuseSession>
 where
     ClientBuilder: FnOnce(&CliArgs) -> anyhow::Result<(Client, Runtime, S3Personality)>,
-    Client: ObjectClient + Send + Sync + 'static,
+    Client: ObjectClient + Clone + Send + Sync + 'static,
     Runtime: Spawn + Send + Sync + 'static,
 {
     tracing::info!("mount-s3 {}", build_info::FULL_VERSION);
@@ -835,27 +835,13 @@ where
     }
 
     if let Some(xoz_bucket_name) = args.cache_xoz {
-        // When using the same CRT client, it was hanging, see https://t.corp.amazon.com/D132039029/communication.
-        // So we create a new client for the xoz cache.
-        let new_args = CliArgs {
-            bucket_name: xoz_bucket_name.clone(),
-            storage_class: None,
-            sse: None,
-            sse_kms_key_id: None,
-            cache: None,
-            cache_xoz: None, // nothing is going to need this value anymore
-            ..args
-        };
-        let (xoz_client, _runtime, _personality) =
-            create_s3_client(&new_args).expect("could not create s3 client for xoz cache");
-        let cache = XozDataCache::new(&xoz_bucket_name, xoz_client, new_args.cache_block_size);
-
+        let cache = XozDataCache::new(&xoz_bucket_name, client.clone(), args.cache_block_size);
         let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
         let fuse_session = create_filesystem(
             client,
             prefetcher,
             &args.bucket_name,
-            &new_args.prefix.unwrap_or_default(),
+            &args.prefix.unwrap_or_default(),
             filesystem_config,
             fuse_config,
             &bucket_description,
@@ -886,7 +872,7 @@ fn create_filesystem<Client, Prefetcher>(
     bucket_description: &str,
 ) -> anyhow::Result<FuseSession>
 where
-    Client: ObjectClient + Send + Sync + 'static,
+    Client: ObjectClient + Clone + Send + Sync + 'static,
     Prefetcher: Prefetch + Send + Sync + 'static,
 {
     tracing::trace!(?filesystem_config, "creating file system");
