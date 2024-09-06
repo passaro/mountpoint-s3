@@ -2,6 +2,7 @@ use crate::object::ObjectId;
 
 use super::{BlockIndex, ChecksummedBytes, DataCache, DataCacheResult};
 
+use async_trait::async_trait;
 use bytes::BytesMut;
 use futures::{pin_mut, StreamExt};
 use mountpoint_s3_client::types::PutObjectParams;
@@ -78,22 +79,23 @@ where
         DataCacheResult::Ok(())
     }
 }
+
+#[async_trait]
 impl<Client> DataCache for XozDataCache<Client>
 where
     Client: ObjectClient + Send + Sync + 'static,
 {
-    fn get_block(
+    async fn get_block(
         &self,
         cache_key: &ObjectId,
         block_idx: BlockIndex,
         _block_offset: u64, // TODO: should we use this?
     ) -> DataCacheResult<Option<ChecksummedBytes>> {
         let object_key = object_key(cache_key, block_idx);
-
-        return futures::executor::block_on(self.get_block_xoz(object_key));
+        self.get_block_xoz(object_key).await
     }
 
-    fn put_block(
+    async fn put_block(
         &self,
         cache_key: ObjectId,
         block_idx: BlockIndex,
@@ -101,7 +103,7 @@ where
         bytes: ChecksummedBytes,
     ) -> DataCacheResult<()> {
         let object_key = object_key(&cache_key, block_idx);
-        return futures::executor::block_on(self.put_block_xoz(object_key, bytes));
+        self.put_block_xoz(object_key, bytes).await
     }
 
     fn block_size(&self) -> u64 {

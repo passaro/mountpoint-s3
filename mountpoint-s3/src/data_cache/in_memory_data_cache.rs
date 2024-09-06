@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::default::Default;
 
+use async_trait::async_trait;
+
 use super::{BlockIndex, ChecksummedBytes, DataCache, DataCacheError, DataCacheResult};
 use crate::object::ObjectId;
 use crate::sync::RwLock;
@@ -27,10 +29,8 @@ impl InMemoryDataCache {
         let data = self.data.read().unwrap();
         data.get(cache_key).map_or(0, |cache| cache.len())
     }
-}
 
-impl DataCache for InMemoryDataCache {
-    fn get_block(
+    fn get_block_impl(
         &self,
         cache_key: &ObjectId,
         block_idx: BlockIndex,
@@ -44,7 +44,7 @@ impl DataCache for InMemoryDataCache {
         Ok(block_data)
     }
 
-    fn put_block(
+    fn put_block_impl(
         &self,
         cache_key: ObjectId,
         block_idx: BlockIndex,
@@ -58,6 +58,28 @@ impl DataCache for InMemoryDataCache {
         let blocks = data.entry(cache_key).or_default();
         blocks.insert(block_idx, bytes);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl DataCache for InMemoryDataCache {
+    async fn get_block(
+        &self,
+        cache_key: &ObjectId,
+        block_idx: BlockIndex,
+        block_offset: u64,
+    ) -> DataCacheResult<Option<ChecksummedBytes>> {
+        self.get_block_impl(cache_key, block_idx, block_offset)
+    }
+
+    async fn put_block(
+        &self,
+        cache_key: ObjectId,
+        block_idx: BlockIndex,
+        block_offset: u64,
+        bytes: ChecksummedBytes,
+    ) -> DataCacheResult<()> {
+        self.put_block_impl(cache_key, block_idx, block_offset, bytes)
     }
 
     fn block_size(&self) -> u64 {
@@ -86,7 +108,7 @@ mod tests {
         let cache_key_1 = ObjectId::new("a".into(), ETag::for_tests());
         let cache_key_2 = ObjectId::new("b".into(), ETag::for_tests());
 
-        let block = cache.get_block(&cache_key_1, 0, 0).expect("cache is accessible");
+        let block = cache.get_block_impl(&cache_key_1, 0, 0).expect("cache is accessible");
         assert!(
             block.is_none(),
             "no entry should be available to return but got {:?}",
@@ -95,10 +117,10 @@ mod tests {
 
         // PUT and GET, OK?
         cache
-            .put_block(cache_key_1.clone(), 0, 0, data_1.clone())
+            .put_block_impl(cache_key_1.clone(), 0, 0, data_1.clone())
             .expect("cache is accessible");
         let entry = cache
-            .get_block(&cache_key_1, 0, 0)
+            .get_block_impl(&cache_key_1, 0, 0)
             .expect("cache is accessible")
             .expect("cache entry should be returned");
         assert_eq!(
@@ -108,10 +130,10 @@ mod tests {
 
         // PUT AND GET a second file, OK?
         cache
-            .put_block(cache_key_2.clone(), 0, 0, data_2.clone())
+            .put_block_impl(cache_key_2.clone(), 0, 0, data_2.clone())
             .expect("cache is accessible");
         let entry = cache
-            .get_block(&cache_key_2, 0, 0)
+            .get_block_impl(&cache_key_2, 0, 0)
             .expect("cache is accessible")
             .expect("cache entry should be returned");
         assert_eq!(
@@ -121,10 +143,10 @@ mod tests {
 
         // PUT AND GET a second block in a cache entry, OK?
         cache
-            .put_block(cache_key_1.clone(), 1, block_size, data_3.clone())
+            .put_block_impl(cache_key_1.clone(), 1, block_size, data_3.clone())
             .expect("cache is accessible");
         let entry = cache
-            .get_block(&cache_key_1, 1, block_size)
+            .get_block_impl(&cache_key_1, 1, block_size)
             .expect("cache is accessible")
             .expect("cache entry should be returned");
         assert_eq!(
@@ -134,7 +156,7 @@ mod tests {
 
         // Entry 1's first block still intact
         let entry = cache
-            .get_block(&cache_key_1, 0, 0)
+            .get_block_impl(&cache_key_1, 0, 0)
             .expect("cache is accessible")
             .expect("cache entry should be returned");
         assert_eq!(

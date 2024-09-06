@@ -6,6 +6,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use linked_hash_map::LinkedHashMap;
 use mountpoint_s3_crt::checksums::crc32c::{self, Crc32c};
@@ -342,22 +343,8 @@ impl DiskDataCache {
         }
         Ok(())
     }
-}
 
-/// Hash the cache key using its fields as well as the [CACHE_VERSION].
-fn hash_cache_key_raw(cache_key: &ObjectId) -> [u8; 32] {
-    let s3_key = cache_key.key();
-    let etag = cache_key.etag();
-
-    let mut hasher = Sha256::new();
-    hasher.update(CACHE_VERSION.as_bytes());
-    hasher.update(s3_key);
-    hasher.update(etag.as_str());
-    hasher.finalize().into()
-}
-
-impl DataCache for DiskDataCache {
-    fn get_block(
+    fn get_block_impl(
         &self,
         cache_key: &ObjectId,
         block_idx: BlockIndex,
@@ -402,7 +389,7 @@ impl DataCache for DiskDataCache {
         }
     }
 
-    fn put_block(
+    fn put_block_impl(
         &self,
         cache_key: ObjectId,
         block_idx: BlockIndex,
@@ -439,6 +426,40 @@ impl DataCache for DiskDataCache {
         }
 
         Ok(())
+    }
+}
+
+/// Hash the cache key using its fields as well as the [CACHE_VERSION].
+fn hash_cache_key_raw(cache_key: &ObjectId) -> [u8; 32] {
+    let s3_key = cache_key.key();
+    let etag = cache_key.etag();
+
+    let mut hasher = Sha256::new();
+    hasher.update(CACHE_VERSION.as_bytes());
+    hasher.update(s3_key);
+    hasher.update(etag.as_str());
+    hasher.finalize().into()
+}
+
+#[async_trait]
+impl DataCache for DiskDataCache {
+    async fn get_block(
+        &self,
+        cache_key: &ObjectId,
+        block_idx: BlockIndex,
+        block_offset: u64,
+    ) -> DataCacheResult<Option<ChecksummedBytes>> {
+        self.get_block_impl(cache_key, block_idx, block_offset)
+    }
+
+    async fn put_block(
+        &self,
+        cache_key: ObjectId,
+        block_idx: BlockIndex,
+        block_offset: u64,
+        bytes: ChecksummedBytes,
+    ) -> DataCacheResult<()> {
+        self.put_block_impl(cache_key, block_idx, block_offset, bytes)
     }
 
     fn block_size(&self) -> u64 {
@@ -649,7 +670,9 @@ mod tests {
             ETag::for_tests(),
         );
 
-        let block = cache.get_block(&cache_key_1, 0, 0).expect("cache should be accessible");
+        let block = cache
+            .get_block_impl(&cache_key_1, 0, 0)
+            .expect("cache should be accessible");
         assert!(
             block.is_none(),
             "no entry should be available to return but got {:?}",
@@ -658,10 +681,10 @@ mod tests {
 
         // PUT and GET, OK?
         cache
-            .put_block(cache_key_1.clone(), 0, 0, data_1.clone())
+            .put_block_impl(cache_key_1.clone(), 0, 0, data_1.clone())
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 0, 0)
+            .get_block_impl(&cache_key_1, 0, 0)
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
         assert_eq!(
@@ -671,10 +694,10 @@ mod tests {
 
         // PUT AND GET a second file, OK?
         cache
-            .put_block(cache_key_2.clone(), 0, 0, data_2.clone())
+            .put_block_impl(cache_key_2.clone(), 0, 0, data_2.clone())
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_2, 0, 0)
+            .get_block_impl(&cache_key_2, 0, 0)
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
         assert_eq!(
@@ -684,10 +707,10 @@ mod tests {
 
         // PUT AND GET a second block in a cache entry, OK?
         cache
-            .put_block(cache_key_1.clone(), 1, block_size, data_3.clone())
+            .put_block_impl(cache_key_1.clone(), 1, block_size, data_3.clone())
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 1, block_size)
+            .get_block_impl(&cache_key_1, 1, block_size)
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
         assert_eq!(
@@ -697,7 +720,7 @@ mod tests {
 
         // Entry 1's first block still intact
         let entry = cache
-            .get_block(&cache_key_1, 0, 0)
+            .get_block_impl(&cache_key_1, 0, 0)
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
         assert_eq!(
@@ -722,10 +745,10 @@ mod tests {
         let cache_key = ObjectId::new("a".into(), ETag::for_tests());
 
         cache
-            .put_block(cache_key.clone(), 0, 0, slice.clone())
+            .put_block_impl(cache_key.clone(), 0, 0, slice.clone())
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key, 0, 0)
+            .get_block_impl(&cache_key, 0, 0)
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
         assert_eq!(
@@ -757,7 +780,7 @@ mod tests {
             expected_bytes: &ChecksummedBytes,
         ) -> bool {
             if let Some(retrieved) = cache
-                .get_block(cache_key, block_idx, block_idx * (BLOCK_SIZE) as u64)
+                .get_block_impl(cache_key, block_idx, block_idx * (BLOCK_SIZE) as u64)
                 .expect("cache should be accessible")
             {
                 assert_eq!(
@@ -799,7 +822,7 @@ mod tests {
         // Put all of large_object
         for (block_idx, bytes) in large_object_blocks.iter().enumerate() {
             cache
-                .put_block(
+                .put_block_impl(
                     large_object_key.clone(),
                     block_idx as u64,
                     (block_idx * BLOCK_SIZE) as u64,
@@ -811,7 +834,7 @@ mod tests {
         // Put all of small_object
         for (block_idx, bytes) in small_object_blocks.iter().enumerate() {
             cache
-                .put_block(
+                .put_block_impl(
                     small_object_key.clone(),
                     block_idx as u64,
                     (block_idx * BLOCK_SIZE) as u64,

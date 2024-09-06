@@ -128,7 +128,7 @@ where
         // already likely negligible.
         let mut block_offset = block_range.start * block_size;
         for block_index in block_range.clone() {
-            match self.cache.get_block(cache_key, block_index, block_offset) {
+            match self.cache.get_block(cache_key, block_index, block_offset).await {
                 Ok(Some(block)) => {
                     trace!(?cache_key, ?range, block_index, "cache hit");
                     // Cache blocks always contain bytes in the request range
@@ -311,7 +311,8 @@ where
                     self.block_index,
                     self.block_offset,
                     &self.cache_key,
-                );
+                )
+                .await;
                 self.block_index += 1;
                 self.block_offset += block_size;
                 self.buffer = ChecksummedBytes::default();
@@ -333,13 +334,14 @@ where
                 self.block_index,
                 self.block_offset,
                 &self.cache_key,
-            );
+            )
+            .await;
         }
         Ok(())
     }
 }
 
-fn update_cache<Cache: DataCache + Send + Sync>(
+async fn update_cache<Cache: DataCache + Send + Sync>(
     cache: &Cache,
     block: &ChecksummedBytes,
     block_index: u64,
@@ -348,12 +350,12 @@ fn update_cache<Cache: DataCache + Send + Sync>(
 ) {
     // TODO: consider updating the cache asynchronously
     let start = Instant::now();
-    match cache.put_block(object_id.clone(), block_index, block_offset, block.clone()) {
-        Ok(()) => {}
-        Err(error) => {
-            warn!(key=?object_id, block_index, ?error, "failed to update cache");
-        }
-    };
+    if let Err(error) = cache
+        .put_block(object_id.clone(), block_index, block_offset, block.clone())
+        .await
+    {
+        warn!(key=?object_id, block_index, ?error, "failed to update cache");
+    }
     metrics::histogram!("prefetch.cache_update_duration_us").record(start.elapsed().as_micros() as f64);
 }
 
