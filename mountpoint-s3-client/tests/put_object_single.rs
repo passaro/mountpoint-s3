@@ -30,7 +30,7 @@ async fn test_put_object_single(
         .expect("put_object should succeed");
 
     let result = client
-        .get_object(bucket, key, None, None)
+        .get_object(bucket, key, None, Some(put_object_result.etag.clone()))
         .await
         .expect("get_object should succeed");
     check_get_result(result, None, &contents[..]).await;
@@ -54,7 +54,7 @@ async fn test_put_object_single_empty(
         .expect("put_object should succeed");
 
     let result = client
-        .get_object(bucket, key, None, None)
+        .get_object(bucket, key, None, Some(put_object_result.etag.clone()))
         .await
         .expect("get_object should succeed");
     check_get_result(result, None, &[]).await;

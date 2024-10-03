@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -8,13 +9,15 @@ use crate::s3_crt_client::{
 };
 use async_trait::async_trait;
 use futures::channel::oneshot;
-use mountpoint_s3_crt::http::request_response::{Header, Headers};
+use mountpoint_s3_crt::http::request_response::{Header, Headers, HeadersError};
 use mountpoint_s3_crt::io::stream::InputStream;
 use mountpoint_s3_crt::s3::client::{ChecksumConfig, RequestType, UploadReview};
+use thiserror::Error;
 use tracing::error;
 
 use super::S3Message;
 
+const ETAG_HEADER_NAME: &str = "ETag";
 const SSE_TYPE_HEADER_NAME: &str = "x-amz-server-side-encryption";
 const SSE_KEY_ID_HEADER_NAME: &str = "x-amz-server-side-encryption-aws-kms-key-id";
 
@@ -118,7 +121,7 @@ impl S3CrtClient {
         let elapsed = start_time.elapsed();
         emit_throughput_metric(content_length as u64, elapsed, "put_object");
 
-        Ok(extract_result(&response_headers))
+        Ok(extract_result(&response_headers).map_err(|e| S3RequestError::InternalError(Box::new(e)))?)
     }
 
     fn new_put_request(
@@ -230,16 +233,36 @@ fn try_get_header_value(headers: &Headers, key: &str) -> Option<String> {
     headers.get(key).ok()?.value().clone().into_string().ok()
 }
 
-fn extract_result(response_headers: &Mutex<Option<Headers>>) -> PutObjectResult {
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ParseError {
+    #[error("Header response error: {0}")]
+    Header(#[from] HeadersError),
+
+    #[error("Header string was not valid: {0:?}")]
+    Invalid(OsString),
+}
+
+fn extract_result(response_headers: &Mutex<Option<Headers>>) -> Result<PutObjectResult, ParseError> {
     let response_headers = response_headers
         .lock()
         .expect("must be able to acquire headers lock")
         .take()
         .expect("PUT response headers must be available at this point");
-    PutObjectResult {
+
+    let etag = response_headers
+        .get(ETAG_HEADER_NAME)?
+        .value()
+        .clone()
+        .into_string()
+        .map_err(ParseError::Invalid)?
+        .into();
+
+    Ok(PutObjectResult {
+        etag,
         sse_type: try_get_header_value(&response_headers, SSE_TYPE_HEADER_NAME),
         sse_kms_key_id: try_get_header_value(&response_headers, SSE_KEY_ID_HEADER_NAME),
-    }
+    })
 }
 
 #[cfg_attr(not(docsrs), async_trait)]
@@ -308,7 +331,7 @@ impl PutObjectRequest for S3PutObjectRequest {
         let elapsed = self.start_time.elapsed();
         emit_throughput_metric(self.total_bytes, elapsed, "put_object");
 
-        Ok(extract_result(&self.response_headers))
+        Ok(extract_result(&self.response_headers).map_err(|e| S3RequestError::InternalError(Box::new(e)))?)
     }
 }
 

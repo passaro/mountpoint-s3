@@ -63,6 +63,12 @@ impl FromStr for ETag {
     }
 }
 
+impl<S: AsRef<str>> From<S> for ETag {
+    fn from(value: S) -> Self {
+        Self(value.as_ref().to_string())
+    }
+}
+
 /// A generic interface to S3-like object storage services.
 ///
 /// This trait defines the common methods that all object services implement.
@@ -429,6 +435,8 @@ pub trait PutObjectRequest: Send {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct PutObjectResult {
+    /// ETag of the uploaded object
+    pub etag: ETag,
     /// Server-side encryption type that was used to store new object (reported by S3)
     pub sse_type: Option<String>,
     /// Server-side encryption KMS key ID that was used to store new object (reported by S3)
