@@ -66,6 +66,7 @@ libc_flags! {
         O_SYNC,
         O_TRUNC,
         O_DSYNC,
+        O_DIRECT,
 
         // Incomplete list. To be integrated if/when required.
     }
