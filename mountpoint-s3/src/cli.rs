@@ -536,7 +536,7 @@ impl CliArgs {
 
     fn fuse_session_config(&self) -> anyhow::Result<FuseSessionConfig> {
         let mount_point = MountPoint::new(&self.mount_point).context("Failed to create mount point")?;
-        let fs_name = String::from("mountpoint-s3");
+        let fs_name = format!("s3://{}", self.bucket_name);
         let mut options = vec![
             MountOption::DefaultPermissions,
             MountOption::FSName(fs_name),
