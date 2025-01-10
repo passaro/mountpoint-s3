@@ -54,7 +54,7 @@ fn run_in_background() -> Result<(), Box<dyn std::error::Error>> {
 
     // verify mount status and mount entry
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &prefix, &region, &mount_point.to_path_buf());
 
@@ -71,7 +71,7 @@ fn run_in_background_with_passed_fuse_fd() -> Result<(), Box<dyn std::error::Err
 
     let (fd, _mount) = mount_for_passing_fuse_fd(
         mount_point.path(),
-        &[MountOption::FSName("mountpoint-s3-fd".to_string())],
+        &[MountOption::FSName(format!("s3://{}", bucket))],
     );
 
     let mut cmd = Command::cargo_bin("mount-s3")?;
@@ -87,7 +87,7 @@ fn run_in_background_with_passed_fuse_fd() -> Result<(), Box<dyn std::error::Err
 
     // verify mount status and mount entry
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3-fd", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &prefix, &region, &mount_point.to_path_buf());
 
@@ -117,7 +117,7 @@ fn run_in_background_region_from_env() -> Result<(), Box<dyn std::error::Error>>
 
     // verify mount status and mount entry
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &prefix, &region, &mount_point.to_path_buf());
 
@@ -148,7 +148,7 @@ fn run_in_background_automatic_region_resolution() -> Result<(), Box<dyn std::er
 
     // verify mount status and mount entry
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &prefix, &region, &mount_point.to_path_buf());
 
@@ -175,13 +175,13 @@ fn run_in_foreground() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut child = cmd.spawn().expect("unable to spawn child");
-    wait_for_mount("mountpoint-s3", mount_point.path().to_str().unwrap());
+    wait_for_mount(&bucket, mount_point.path().to_str().unwrap());
 
     // verify that process is still alive
     let child_status = child.try_wait().unwrap();
     assert_eq!(None, child_status);
 
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &prefix, &region, &mount_point.to_path_buf());
 
@@ -198,7 +198,7 @@ fn run_in_foreground_with_passed_fuse_fd() -> Result<(), Box<dyn std::error::Err
 
     let (fd, _mount) = mount_for_passing_fuse_fd(
         mount_point.path(),
-        &[MountOption::FSName("mountpoint-s3-fd".to_string())],
+        &[MountOption::FSName(format!("s3://{}", bucket))],
     );
 
     let mut cmd = Command::cargo_bin("mount-s3")?;
@@ -211,7 +211,7 @@ fn run_in_foreground_with_passed_fuse_fd() -> Result<(), Box<dyn std::error::Err
         .spawn()
         .expect("unable to spawn child");
 
-    wait_for_mount("mountpoint-s3-fd", mount_point.path().to_str().unwrap());
+    wait_for_mount(&bucket, mount_point.path().to_str().unwrap());
 
     let child_exit_status = child.try_wait().unwrap();
     assert_eq!(
@@ -219,7 +219,7 @@ fn run_in_foreground_with_passed_fuse_fd() -> Result<(), Box<dyn std::error::Err
         "child exit status should be None as it should still be running"
     );
 
-    assert!(mount_exists("mountpoint-s3-fd", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &prefix, &region, &mount_point.to_path_buf());
 
@@ -236,7 +236,7 @@ fn run_in_background_with_passed_fuse_fd_fail_on_mount() -> Result<(), Box<dyn s
 
     let (fd, mount) = mount_for_passing_fuse_fd(
         mount_point.path(),
-        &[MountOption::FSName("mountpoint-s3-fd".to_string())],
+        &[MountOption::FSName(format!("s3://{}", bucket))],
     );
 
     let mut cmd = Command::cargo_bin("mount-s3")?;
@@ -253,7 +253,7 @@ fn run_in_background_with_passed_fuse_fd_fail_on_mount() -> Result<(), Box<dyn s
 
     // verify mount status and mount entry
     assert!(!exit_status.success());
-    assert!(!mount_exists("mountpoint-s3-fd", mount_point.path().to_str().unwrap()));
+    assert!(!mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     Ok(())
 }
@@ -275,7 +275,7 @@ fn run_in_background_fail_on_mount() -> Result<(), Box<dyn std::error::Error>> {
 
     // verify mount status and mount entry
     assert!(!exit_status.success());
-    assert!(!mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(!mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     Ok(())
 }
@@ -300,7 +300,7 @@ fn run_in_foreground_fail_on_mount() -> Result<(), Box<dyn std::error::Error>> {
 
     // verify mount status and mount entry
     assert!(!exit_status.success());
-    assert!(!mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(!mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     Ok(())
 }
@@ -326,7 +326,7 @@ fn run_fail_on_duplicate_mount() -> Result<(), Box<dyn std::error::Error>> {
 
     // verify mount status and mount entry
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     let mut cmd = Command::cargo_bin("mount-s3")?;
     cmd.arg(&bucket)
@@ -418,7 +418,7 @@ fn run_fail_on_non_fuse_fd_if_mount_options_passed(mount_options: &[&str]) -> Re
 
     let (fd, _mount) = mount_for_passing_fuse_fd(
         mount_point.path(),
-        &[MountOption::FSName("mountpoint-s3-fd".to_string())],
+        &[MountOption::FSName(format!("s3://{}", bucket))],
     );
 
     let mut cmd = Command::cargo_bin("mount-s3")?;
@@ -468,14 +468,14 @@ fn mount_readonly() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut child = cmd.spawn().expect("unable to spawn child");
-    wait_for_mount("mountpoint-s3", mount_point.path().to_str().unwrap());
+    wait_for_mount(&bucket, mount_point.path().to_str().unwrap());
 
     // verify that process is still alive
     let child_status = child.try_wait().unwrap();
     assert_eq!(None, child_status);
 
     let mount_line =
-        get_mount_from_source_and_mountpoint("mountpoint-s3", mount_point.path().to_str().unwrap()).unwrap();
+        get_mount_from_bucket_and_mountpoint(&bucket, mount_point.path().to_str().unwrap()).unwrap();
 
     // mount entry looks like
     // /dev/nvme0n1p2 on /boot type ext4 (rw,relatime)
@@ -513,7 +513,7 @@ fn mount_allow_delete(allow_delete: bool) -> Result<(), Box<dyn std::error::Erro
 
     // verify mount status and mount entry
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     // create and try to delete an object
     create_objects(&bucket, &prefix, &region, "file.txt", b"hello world");
@@ -555,7 +555,7 @@ fn mount_disable_checksums(disable_checksums: bool) -> Result<(), Box<dyn std::e
 
     // verify mount status and mount entry
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     // try to upload an object
     {
@@ -632,7 +632,7 @@ fn mount_scoped_credentials() -> Result<(), Box<dyn std::error::Error>> {
 
     // verify mount status and mount entry
     assert!(!exit_status.success());
-    assert!(!mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(!mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     // Now try with the subprefix -- mount should work since we have the right permissions
     let mut cmd = Command::cargo_bin("mount-s3")?;
@@ -652,7 +652,7 @@ fn mount_scoped_credentials() -> Result<(), Box<dyn std::error::Error>> {
 
     // verify mount status and mount entry
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &subprefix, &region, &mount_point.to_path_buf());
 
@@ -692,7 +692,7 @@ fn mount_with_sse(
     }
 
     let child = cmd.spawn().expect("unable to spawn child");
-    wait_for_mount("mountpoint-s3", mount_point.to_str().unwrap());
+    wait_for_mount(&bucket, mount_point.to_str().unwrap());
     child
 }
 
@@ -727,7 +727,7 @@ fn mount_with_assumed_role() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify mount status and mount entry
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &prefix, &region, &mount_point.to_path_buf());
 
@@ -776,7 +776,7 @@ fn mount_with_assumed_role_in_other_region() -> Result<(), Box<dyn std::error::E
 
     // Verify mount status and mount entry
     assert!(!exit_status.success());
-    assert!(!mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(!mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     // Next, verify the mount succeeds when assuming a role in other valid region
     let config_file = create_cli_config_file(profile_name, source_profile, &subsession_role, Some(&other_region))?;
@@ -807,7 +807,7 @@ fn mount_with_assumed_role_in_other_region() -> Result<(), Box<dyn std::error::E
     // in the config file. However, Mountpoint never use that file for S3 endpoint resolver and
     // try to resolve the endpoint on its own.
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &prefix, &region, &mount_point.to_path_buf());
 
@@ -853,7 +853,7 @@ fn mount_with_assumed_role_no_region() -> Result<(), Box<dyn std::error::Error>>
     let exit_status = wait_for_exit(child);
 
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &prefix, &region, &mount_point.to_path_buf());
 
@@ -894,7 +894,7 @@ fn run_fail_when_assume_role_with_invalid_arn() -> Result<(), Box<dyn std::error
 
     // Verify mount status and mount entry
     assert!(exit_status.success());
-    assert!(mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     test_read_files(&bucket, &prefix, &region, &mount_point.to_path_buf());
 
@@ -921,7 +921,7 @@ fn run_fail_when_assume_role_with_invalid_arn() -> Result<(), Box<dyn std::error
 
     // Verify mount status and mount entry
     assert!(!exit_status.success());
-    assert!(!mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(!mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 
     Ok(())
 }
@@ -1056,7 +1056,7 @@ fn write_with_sse_kms_key_id_unsupported(key_id: &str) {
     let region = get_test_region();
     let mut cmd = Command::cargo_bin("mount-s3").expect("can not locate mount-s3 binary");
     cmd.stdout(Stdio::piped())
-        .arg(bucket)
+        .arg(&bucket)
         .arg(mount_point.path())
         .arg(format!("--region={region}"))
         .arg(format!("--prefix={prefix}"))
@@ -1071,7 +1071,7 @@ fn write_with_sse_kms_key_id_unsupported(key_id: &str) {
     let child = cmd.spawn().expect("unable to spawn child");
     let exit_status = wait_for_exit(child);
     assert!(!exit_status.success());
-    assert!(!mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()));
+    assert!(!mount_exists(&bucket, mount_point.path().to_str().unwrap()));
 }
 
 fn test_read_files(bucket: &str, prefix: &str, region: &str, mount_point: &PathBuf) {
@@ -1097,16 +1097,16 @@ fn test_read_files(bucket: &str, prefix: &str, region: &str, mount_point: &PathB
     assert_eq!(file_content, "hello world");
 }
 
-fn mount_exists(source: &str, mount_point: &str) -> bool {
-    get_mount_from_source_and_mountpoint(source, mount_point).is_some()
+fn mount_exists(bucket: &str, mount_point: &str) -> bool {
+    get_mount_from_bucket_and_mountpoint(bucket, mount_point).is_some()
 }
 
 /// Read all mount records in the system and return the line that matches given arguments.
 /// # Arguments
 ///
-/// * `source` - name of the file system.
+/// * `bucket` - name of the mounted bucket.
 /// * `mount_point` - path to the mount point.
-fn get_mount_from_source_and_mountpoint(source: &str, mount_point: &str) -> Option<String> {
+fn get_mount_from_bucket_and_mountpoint(bucket: &str, mount_point: &str) -> Option<String> {
     // macOS wrap its temp directory under /private but it's not visible to users
     #[cfg(target_os = "macos")]
     let mount_point = format!("/private{}", mount_point);
@@ -1119,11 +1119,12 @@ fn get_mount_from_source_and_mountpoint(source: &str, mount_point: &str) -> Opti
     let stdout_reader = BufReader::new(Cursor::new(output.stdout));
     let stdout_lines = stdout_reader.lines();
 
+    let source = format!("s3://{}", bucket);
     for line in stdout_lines.map_while(Result::ok) {
         let str: Vec<&str> = line.split_whitespace().collect();
         let source_rec = str[0];
         let mount_point_rec = str[2];
-        if source_rec == source && mount_point_rec == mount_point {
+        if source_rec == &source && mount_point_rec == mount_point {
             return Some(line);
         }
     }
@@ -1144,14 +1145,14 @@ fn wait_for_exit(mut child: Child) -> ExitStatus {
     }
 }
 
-fn wait_for_mount(source: &str, mount_point: &str) {
+fn wait_for_mount(bucket: &str, mount_point: &str) {
     let st = Instant::now();
 
     loop {
         if st.elapsed() > MAX_WAIT_DURATION {
             panic!("wait for mount timeout")
         }
-        if mount_exists(source, mount_point) {
+        if mount_exists(bucket, mount_point) {
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
