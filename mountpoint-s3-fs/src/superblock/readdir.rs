@@ -41,8 +41,8 @@
 //!   These children are listed only once, at the start of the readdir operation, and so are a
 //!   snapshot in time of the directory.
 
-use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::{cmp::Ordering, ops::Deref};
 
 use mountpoint_s3_client::types::ObjectInfo;
 use mountpoint_s3_client::ObjectClient;
@@ -50,7 +50,7 @@ use tracing::{error, trace, warn};
 
 use crate::sync::{Arc, AsyncMutex, Mutex};
 
-use super::{InodeError, InodeKind, InodeKindData, InodeNo, InodeStat, LookedUp, RemoteLookup, SuperblockInner};
+use super::{InodeError, InodeKind, InodeNo, InodeState, LookedUp, RemoteLookup, SuperblockInner};
 
 /// Handle for an inflight directory listing
 #[derive(Debug)]
@@ -72,17 +72,18 @@ impl ReaddirHandle {
     ) -> Result<Self, InodeError> {
         let local_entries = {
             let inode = inner.get(dir_ino)?;
-            let kind_data = &inode.get_inode_state()?.kind_data;
-            let local_files = match kind_data {
-                InodeKindData::File { .. } => return Err(InodeError::NotADirectory(inode.err())),
-                InodeKindData::Directory { writing_children, .. } => writing_children.iter().map(|ino| {
-                    let inode = inner.get(*ino)?;
-                    let stat = inode.get_inode_state()?.stat.clone();
-                    Ok(ReaddirEntry::LocalInode {
-                        lookup: LookedUp { inode, stat },
-                    })
-                }),
+
+            let InodeState::Directory(dir_state) = &*inode.get_inode_state()? else {
+                return Err(InodeError::NotADirectory(inode.err()));
             };
+
+            let local_files = dir_state.writing_children.iter().map(|ino| {
+                let inode = inner.get(*ino)?;
+                let stat = inner.stat_for_inode(inode.get_inode_state()?.deref());
+                Ok(ReaddirEntry::LocalInode {
+                    lookup: LookedUp { inode, stat },
+                })
+            });
 
             match local_files.collect::<Result<Vec<_>, _>>() {
                 Ok(mut new_results) => {
@@ -166,27 +167,14 @@ impl ReaddirHandle {
             // the same name, because [LocalInode] is last in the ordering and so otherwise would
             // have been deduplicated by now.
             ReaddirEntry::LocalInode { .. } => None,
-            ReaddirEntry::RemotePrefix { .. } => {
-                let stat = InodeStat::for_directory(self.inner.mount_time, self.inner.config.cache_config.dir_ttl);
-                Some(RemoteLookup {
-                    stat,
-                    kind: InodeKind::Directory,
-                })
-            }
-            ReaddirEntry::RemoteObject { object_info, .. } => {
-                let stat = InodeStat::for_file(
-                    object_info.size as usize,
-                    object_info.last_modified,
-                    Some(object_info.etag.clone()),
-                    object_info.storage_class.clone(),
-                    object_info.restore_status,
-                    self.inner.config.cache_config.file_ttl,
-                );
-                Some(RemoteLookup {
-                    stat,
-                    kind: InodeKind::File,
-                })
-            }
+            ReaddirEntry::RemotePrefix { .. } => Some(RemoteLookup::Prefix),
+            ReaddirEntry::RemoteObject { object_info, .. } => Some(RemoteLookup::Object {
+                size: object_info.size as usize,
+                last_modified: object_info.last_modified,
+                etag: object_info.etag.clone(),
+                storage_class: object_info.storage_class.clone(),
+                restore_status: object_info.restore_status,
+            }),
         }
     }
 

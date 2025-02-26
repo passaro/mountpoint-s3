@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
+use std::ops::DerefMut;
 use std::time::{Duration, SystemTime};
 
 use fuser::FileType;
@@ -9,7 +10,7 @@ use time::OffsetDateTime;
 use tracing::trace;
 
 use crate::prefix::Prefix;
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::path::ValidKey;
@@ -34,6 +35,10 @@ struct InodeInner {
     parent: InodeNo,
     valid_key: ValidKey,
     checksum: Crc32c,
+
+    /// Number of references the kernel is holding to the [Inode].
+    /// A number of FS operations increment this, while the kernel calls [`Inode::forget(ino, n)`] to decrement.
+    lookup_count: AtomicU64,
 
     /// Mutable inode state. This lock should also be held to serialize operations on an inode (like
     /// creating a new child).
@@ -78,43 +83,35 @@ impl Inode {
     ///
     /// Locks [InodeState] for writing.
     pub(super) fn inc_lookup_count(&self) -> u64 {
-        let mut state = self.inner.sync.write().unwrap();
-        let lookup_count = &mut state.lookup_count;
-        *lookup_count += 1;
-        trace!(
-            ino = self.ino(),
-            new_lookup_count = lookup_count,
-            "incremented lookup count",
-        );
-        *lookup_count
+        let lookup_count = self.inner.lookup_count.fetch_add(1, Ordering::SeqCst);
+        let new_lookup_count = lookup_count + 1;
+        trace!(ino = self.ino(), new_lookup_count, "incremented lookup count",);
+        new_lookup_count
     }
 
     /// Decrement lookup count by `n` for [Inode], returning the new value.
     ///
     /// Locks [InodeState] for writing.
     pub(super) fn dec_lookup_count(&self, n: u64) -> u64 {
-        let mut state = self.inner.sync.write().unwrap();
-        let lookup_count = &mut state.lookup_count;
-        debug_assert!(n <= *lookup_count, "lookup count cannot go negative");
-        *lookup_count = lookup_count.saturating_sub(n);
-        trace!(
-            ino = self.ino(),
-            new_lookup_count = lookup_count,
-            "decremented lookup count",
-        );
-        *lookup_count
+        let lookup_count = self.inner.lookup_count.fetch_sub(n, Ordering::SeqCst);
+        debug_assert!(n <= lookup_count, "lookup count cannot go negative");
+        let new_lookup_count = lookup_count - n;
+        trace!(ino = self.ino(), new_lookup_count, "decremented lookup count",);
+        new_lookup_count
     }
 
     pub fn is_remote(&self) -> Result<bool, InodeError> {
         let state = self.get_inode_state()?;
-        Ok(state.write_status == WriteStatus::Remote)
+        Ok(state.is_remote())
     }
 
     /// return Inode State with read lock after checking whether the directory inode is deleted or not.
     pub(super) fn get_inode_state(&self) -> Result<RwLockReadGuard<InodeState>, InodeError> {
         let inode_state = self.inner.sync.read().unwrap();
-        match &inode_state.kind_data {
-            InodeKindData::Directory { deleted, .. } if *deleted => Err(InodeError::InodeDoesNotExist(self.ino())),
+        match &*inode_state {
+            InodeState::Directory(DirState { deleted, .. }) if *deleted => {
+                Err(InodeError::InodeDoesNotExist(self.ino()))
+            }
             _ => Ok(inode_state),
         }
     }
@@ -122,8 +119,10 @@ impl Inode {
     /// return Inode State with write lock after checking whether the directory inode is deleted or not.
     pub(super) fn get_mut_inode_state(&self) -> Result<RwLockWriteGuard<InodeState>, InodeError> {
         let inode_state = self.inner.sync.write().unwrap();
-        match &inode_state.kind_data {
-            InodeKindData::Directory { deleted, .. } if *deleted => Err(InodeError::InodeDoesNotExist(self.ino())),
+        match &*inode_state {
+            InodeState::Directory(DirState { deleted, .. }) if *deleted => {
+                Err(InodeError::InodeDoesNotExist(self.ino()))
+            }
             _ => Ok(inode_state),
         }
     }
@@ -134,7 +133,14 @@ impl Inode {
     }
 
     /// Create a new inode.
-    pub(super) fn new(ino: InodeNo, parent: InodeNo, key: ValidKey, prefix: &Prefix, state: InodeState) -> Self {
+    pub(super) fn new(
+        ino: InodeNo,
+        parent: InodeNo,
+        key: ValidKey,
+        prefix: &Prefix,
+        state: InodeState,
+        lookup_count: u64,
+    ) -> Self {
         let checksum = Self::compute_checksum(ino, prefix, key.as_ref());
         let sync = RwLock::new(state);
         let inner = InodeInner {
@@ -142,27 +148,23 @@ impl Inode {
             parent,
             valid_key: key,
             checksum,
+            lookup_count: AtomicU64::new(lookup_count),
             sync,
         };
         Self { inner: inner.into() }
     }
 
     /// Create the root inode.
-    pub(super) fn new_root(prefix: &Prefix, mount_time: OffsetDateTime) -> Self {
+    pub(super) fn new_root(prefix: &Prefix) -> Self {
         Self::new(
             ROOT_INODE_NO,
             ROOT_INODE_NO,
             ValidKey::root(),
             prefix,
-            InodeState {
-                // The root inode never expires because there's no remote to consult for its
-                // metadata, and it always exists.
-                stat: InodeStat::for_directory(mount_time, NEVER_EXPIRE_TTL),
-                write_status: WriteStatus::Remote,
-                kind_data: InodeKindData::default_for(InodeKind::Directory),
-                lookup_count: 1,
-                reader_count: 0,
-            },
+            // The root inode never expires because there's no remote to consult for its
+            // metadata, and it always exists.
+            InodeState::Directory(DirState::new(WriteStatus::Remote, NEVER_EXPIRE_TTL)),
+            1,
         )
     }
 
@@ -223,26 +225,166 @@ impl Debug for InodeErrorInfo {
 }
 
 #[derive(Debug)]
-pub(super) struct InodeState {
-    pub stat: InodeStat,
+pub(super) enum InodeState {
+    File(FileState),
+    Directory(DirState),
+}
+
+#[derive(Debug)]
+pub(super) struct FileState {
+    /// Time this stat becomes invalid and needs to be refreshed
+    pub expiry: Expiry,
+
+    /// Size in bytes
+    pub size: usize,
+
+    /// Time of last file content modification
+    pub mtime: OffsetDateTime,
+    /// Time of last file metadata (or content) change
+    pub ctime: OffsetDateTime,
+    /// Time of last access
+    pub atime: OffsetDateTime,
+    /// Etag for the file (object)
+    pub etag: Option<String>,
+    /// Inodes corresponding to S3 objects with GLACIER or DEEP_ARCHIVE storage classes
+    /// are only readable after restoration. For objects with other storage classes
+    /// this field should be always `true`.
+    pub is_readable: bool,
+
     pub write_status: WriteStatus,
-    pub kind_data: InodeKindData,
-    /// Number of references the kernel is holding to the [Inode].
-    /// A number of FS operations increment this, while the kernel calls [`Inode::forget(ino, n)`] to decrement.
-    lookup_count: u64,
     /// Number of active prefetching streams on the [Inode].
     reader_count: u64,
 }
 
+#[derive(Debug)]
+pub(super) struct DirState {
+    /// Time this stat becomes invalid and needs to be refreshed
+    pub expiry: Expiry,
+
+    pub write_status: WriteStatus,
+
+    /// Mapping from child names to previously seen [Inode]s.
+    ///
+    /// The existence of a child or lack thereof does not imply the object does not exist,
+    /// nor that it currently exists in S3 in that state.
+    pub children: HashMap<String, Inode>,
+
+    /// A set of inode numbers that have been opened for write but not completed yet.
+    /// This should be a subset of the [children](Self::Directory::children) field.
+    pub writing_children: HashSet<InodeNo>,
+
+    /// True if this directory has been deleted (`rmdir`) from its parent
+    pub deleted: bool,
+}
+
 impl InodeState {
-    pub fn new(stat: &InodeStat, kind: InodeKind, write_status: WriteStatus) -> Self {
+    pub fn kind(&self) -> InodeKind {
+        match self {
+            InodeState::File(_) => InodeKind::File,
+            InodeState::Directory(_) => InodeKind::Directory,
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        match self {
+            InodeState::File(file_state) => file_state.write_status == WriteStatus::Remote,
+            InodeState::Directory(dir_state) => dir_state.write_status == WriteStatus::Remote,
+        }
+    }
+
+    pub fn etag(&self) -> Option<&str> {
+        match self {
+            InodeState::File(file_state) => file_state.etag.as_deref(),
+            InodeState::Directory(_) => None,
+        }
+    }
+
+    pub fn expiry(&self) -> &Expiry {
+        match self {
+            InodeState::File(file_state) => &file_state.expiry,
+            InodeState::Directory(dir_state) => &dir_state.expiry,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.expiry().is_expired()
+    }
+}
+
+impl DirState {
+    pub fn new(write_status: WriteStatus, validity: Duration) -> Self {
         Self {
-            stat: stat.clone(),
-            kind_data: InodeKindData::default_for(kind),
+            expiry: Expiry::from_now(validity),
             write_status,
-            lookup_count: 0,
+            children: Default::default(),
+            writing_children: Default::default(),
+            deleted: false,
+        }
+    }
+
+    pub fn update_validity(&mut self, validity: Duration) {
+        self.expiry = Expiry::from_now(validity);
+    }
+}
+
+impl FileState {
+    pub fn new(
+        last_modified: OffsetDateTime,
+        write_status: WriteStatus,
+        size: usize,
+        etag: Option<String>,
+        storage_class: Option<&str>,
+        restore_status: Option<RestoreStatus>,
+        validity: Duration,
+    ) -> Self {
+        let is_readable = Self::is_readable(storage_class, restore_status);
+        Self {
+            expiry: Expiry::from_now(validity),
+            write_status,
+            size,
+            etag,
+            atime: last_modified,
+            ctime: last_modified,
+            mtime: last_modified,
+            is_readable,
             reader_count: 0,
         }
+    }
+
+    pub fn update_validity(&mut self, validity: Duration) {
+        self.expiry = Expiry::from_now(validity);
+    }
+
+    /// Objects in flexible retrieval storage classes can't be accessed via GetObject unless they are
+    /// restored, and so we override their permissions to 000 and reject reads to them. We also warn
+    /// the first time we see an object like this, because FUSE enforces the 000 permissions on our
+    /// behalf so we might not see an attempted `open` call.
+    fn is_readable(storage_class: Option<&str>, restore_status: Option<RestoreStatus>) -> bool {
+        static HAS_SENT_WARNING: AtomicBool = AtomicBool::new(false);
+        match storage_class.as_deref() {
+            Some("GLACIER") | Some("DEEP_ARCHIVE") => {
+                let restored =
+                    matches!(restore_status, Some(RestoreStatus::Restored { expiry }) if expiry > SystemTime::now());
+                if !restored && !HAS_SENT_WARNING.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        "objects in the GLACIER and DEEP_ARCHIVE storage classes are only accessible if restored"
+                    );
+                }
+                restored
+            }
+            _ => true,
+        }
+    }
+    
+    pub fn update_from_remote(&mut self, last_modified: OffsetDateTime, size: usize, etag: String, storage_class: Option<&str>, restore_status: Option<RestoreStatus>, validity: Duration) {
+        self.expiry = Expiry::from_now(validity);
+        self.write_status = WriteStatus::Remote;
+        self.size = size;
+        self.etag = Some(etag);
+        self.atime = last_modified;
+        self.ctime = last_modified;
+        self.mtime = last_modified;
+        self.is_readable = Self::is_readable(storage_class, restore_status);
     }
 }
 
@@ -266,38 +408,6 @@ impl From<InodeKind> for FileType {
         match kind {
             InodeKind::File => FileType::RegularFile,
             InodeKind::Directory => FileType::Directory,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(super) enum InodeKindData {
-    File {},
-    Directory {
-        /// Mapping from child names to previously seen [Inode]s.
-        ///
-        /// The existence of a child or lack thereof does not imply the object does not exist,
-        /// nor that it currently exists in S3 in that state.
-        children: HashMap<String, Inode>,
-
-        /// A set of inode numbers that have been opened for write but not completed yet.
-        /// This should be a subset of the [children](Self::Directory::children) field.
-        writing_children: HashSet<InodeNo>,
-
-        /// True if this directory has been deleted (`rmdir`) from its parent
-        deleted: bool,
-    },
-}
-
-impl InodeKindData {
-    pub fn default_for(kind: InodeKind) -> Self {
-        match kind {
-            InodeKind::File => Self::File {},
-            InodeKind::Directory => Self::Directory {
-                children: Default::default(),
-                writing_children: Default::default(),
-                deleted: false,
-            },
         }
     }
 }
@@ -333,71 +443,6 @@ pub enum WriteStatus {
     LocalOpen,
     /// Remote inode
     Remote,
-}
-
-impl InodeStat {
-    pub fn is_valid(&self) -> bool {
-        !self.expiry.is_expired()
-    }
-
-    /// Objects in flexible retrieval storage classes can't be accessed via GetObject unless they are
-    /// restored, and so we override their permissions to 000 and reject reads to them. We also warn
-    /// the first time we see an object like this, because FUSE enforces the 000 permissions on our
-    /// behalf so we might not see an attempted `open` call.
-    fn is_readable(storage_class: Option<String>, restore_status: Option<RestoreStatus>) -> bool {
-        static HAS_SENT_WARNING: AtomicBool = AtomicBool::new(false);
-        match storage_class.as_deref() {
-            Some("GLACIER") | Some("DEEP_ARCHIVE") => {
-                let restored =
-                    matches!(restore_status, Some(RestoreStatus::Restored { expiry }) if expiry > SystemTime::now());
-                if !restored && !HAS_SENT_WARNING.swap(true, Ordering::SeqCst) {
-                    tracing::warn!(
-                        "objects in the GLACIER and DEEP_ARCHIVE storage classes are only accessible if restored"
-                    );
-                }
-                restored
-            }
-            _ => true,
-        }
-    }
-
-    /// Initialize an [InodeStat] for a file, given some metadata.
-    pub fn for_file(
-        size: usize,
-        datetime: OffsetDateTime,
-        etag: Option<String>,
-        storage_class: Option<String>,
-        restore_status: Option<RestoreStatus>,
-        validity: Duration,
-    ) -> InodeStat {
-        let is_readable = Self::is_readable(storage_class, restore_status);
-        InodeStat {
-            expiry: Expiry::from_now(validity),
-            size,
-            atime: datetime,
-            ctime: datetime,
-            mtime: datetime,
-            etag,
-            is_readable,
-        }
-    }
-
-    /// Initialize an [InodeStat] for a directory, given some metadata.
-    pub fn for_directory(datetime: OffsetDateTime, validity: Duration) -> InodeStat {
-        InodeStat {
-            expiry: Expiry::from_now(validity),
-            size: 0,
-            atime: datetime,
-            ctime: datetime,
-            mtime: datetime,
-            etag: None,
-            is_readable: true,
-        }
-    }
-
-    pub fn update_validity(&mut self, validity: Duration) {
-        self.expiry = Expiry::from_now(validity);
-    }
 }
 
 #[derive(Debug, Default)]
@@ -439,13 +484,16 @@ impl WriteHandle {
         is_truncate: bool,
     ) -> Result<Self, InodeError> {
         let mut state = inode.get_mut_inode_state()?;
-        if state.reader_count > 0 {
+        let InodeState::File(file_state) = state.deref_mut() else {
+            return Err(InodeError::IsDirectory(inode.err()));
+        };
+        if file_state.reader_count > 0 {
             return Err(InodeError::InodeNotWritableWhileReading(inode.err()));
         }
-        match state.write_status {
+        match file_state.write_status {
             WriteStatus::LocalUnopened => {
-                state.write_status = WriteStatus::LocalOpen;
-                state.stat.size = 0;
+                file_state.write_status = WriteStatus::LocalOpen;
+                file_state.size = 0;
             }
             WriteStatus::LocalOpen => return Err(InodeError::InodeAlreadyWriting(inode.err())),
             WriteStatus::Remote => {
@@ -454,10 +502,10 @@ impl WriteHandle {
                 }
 
                 if is_truncate {
-                    state.stat.size = 0;
+                    file_state.size = 0;
                 }
 
-                state.write_status = WriteStatus::LocalOpen;
+                file_state.write_status = WriteStatus::LocalOpen;
             }
         }
         drop(state);
@@ -466,7 +514,10 @@ impl WriteHandle {
 
     pub fn inc_file_size(&self, len: usize) {
         let mut state = self.inode.get_mut_inode_state_no_check();
-        state.stat.size += len;
+        let InodeState::File(file_state) = state.deref_mut() else {
+            unreachable!("we know this is a file");
+        };
+        file_state.size += len;
     }
 
     /// Update status of the inode and of containing "local" directories.
@@ -481,7 +532,7 @@ impl WriteHandle {
                 assert!(visited.insert(ancestor_ino), "cycle detected in inode ancestors");
                 let ancestor = self.inner.get(ancestor_ino)?;
                 ancestors.push(ancestor.clone());
-                if ancestor.ino() == ROOT_INODE_NO || ancestor.get_inode_state()?.write_status == WriteStatus::Remote {
+                if ancestor.ino() == ROOT_INODE_NO || ancestor.get_inode_state()?.is_remote() {
                     break;
                 }
                 ancestor_ino = ancestor.parent();
@@ -497,26 +548,27 @@ impl WriteHandle {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut state = self.inode.get_mut_inode_state()?;
-        match state.write_status {
+        let InodeState::File(file_state) = state.deref_mut() else {
+            unreachable!("we know this is a file");
+        };
+        match file_state.write_status {
             WriteStatus::LocalOpen => {
-                state.write_status = WriteStatus::Remote;
-                state.stat.etag = etag.map(|e| e.into_inner());
+                file_state.write_status = WriteStatus::Remote;
+                file_state.etag = etag.map(|e| e.into_inner());
 
                 // Invalidate the inode's stats so we refresh them from S3 when next queried
-                state.stat.update_validity(Duration::from_secs(0));
+                file_state.update_validity(Duration::from_secs(0));
 
                 // Walk up the ancestors from parent to first remote ancestor to transition
                 // the inode and all "local" containing directories to "remote".
                 let children_inos =
                     std::iter::once(self.inode.ino()).chain(ancestors.iter().map(|ancestor| ancestor.ino()));
                 for (ancestor_state, child_ino) in ancestors_states.iter_mut().rev().zip(children_inos) {
-                    match &mut ancestor_state.kind_data {
-                        InodeKindData::File { .. } => unreachable!("we know the ancestor is a directory"),
-                        InodeKindData::Directory { writing_children, .. } => {
-                            writing_children.remove(&child_ino);
-                        }
-                    }
-                    ancestor_state.write_status = WriteStatus::Remote;
+                    let InodeState::Directory(dir_state) = ancestor_state.deref_mut() else {
+                        unreachable!("we know the ancestor is a directory");
+                    };
+                    dir_state.writing_children.remove(&child_ino);
+                    dir_state.write_status = WriteStatus::Remote;
                 }
 
                 Ok(())
@@ -536,10 +588,13 @@ impl ReadHandle {
     /// Create a new read handle
     pub(super) fn new(inode: Inode) -> Result<Self, InodeError> {
         let mut state = inode.get_mut_inode_state()?;
-        if state.write_status != WriteStatus::Remote {
+        let InodeState::File(file_state) = state.deref_mut() else {
+            return Err(InodeError::IsDirectory(inode.err()));
+        };
+        if file_state.write_status != WriteStatus::Remote {
             return Err(InodeError::InodeNotReadableWhileWriting(inode.err()));
         }
-        state.reader_count += 1;
+        file_state.reader_count += 1;
         drop(state);
         Ok(Self { inode })
     }
@@ -548,7 +603,10 @@ impl ReadHandle {
     pub fn finish(self) -> Result<(), InodeError> {
         // Decrease reader count for the inode
         let mut state = self.inode.get_mut_inode_state()?;
-        state.reader_count -= 1;
+        let InodeState::File(file_state) = state.deref_mut() else {
+            unreachable!("we know this is a file");
+        };
+        file_state.reader_count -= 1;
         Ok(())
     }
 }
@@ -576,21 +634,21 @@ mod tests {
                 .new_child(inode_name.try_into().unwrap(), InodeKind::File)
                 .unwrap(),
             &superblock.inner.prefix,
-            InodeState {
-                write_status: WriteStatus::Remote,
-                stat: InodeStat::for_file(0, OffsetDateTime::now_utc(), None, None, None, Default::default()),
-                kind_data: InodeKindData::File {},
-                lookup_count: 5,
-                reader_count: 0,
-            },
+            InodeState::File(FileState::new(
+                OffsetDateTime::now_utc(),
+                WriteStatus::Remote,
+                0,
+                None,
+                None,
+                None,
+                Default::default(),
+            )),
+            5,
         );
         superblock.inner.inodes.write().unwrap().insert(ino, inode.clone());
 
         superblock.forget(ino, 3);
-        let lookup_count = {
-            let inode_state = inode.inner.sync.read().unwrap();
-            inode_state.lookup_count
-        };
+        let lookup_count = inode.inner.lookup_count.load(Ordering::SeqCst);
         assert_eq!(lookup_count, 2, "lookup should have been reduced");
         assert!(
             superblock.inner.get(ino).is_ok(),
@@ -598,10 +656,7 @@ mod tests {
         );
 
         superblock.forget(ino, 2);
-        let lookup_count = {
-            let inode_state = inode.inner.sync.read().unwrap();
-            inode_state.lookup_count
-        };
+        let lookup_count = inode.inner.lookup_count.load(Ordering::SeqCst);
         assert_eq!(lookup_count, 0, "lookup should have been reduced");
         assert!(
             superblock.inner.inodes.read().unwrap().get(&ino).is_none(),
@@ -627,13 +682,13 @@ mod tests {
         let superblock = Superblock::new("test_bucket", &Default::default(), Default::default());
 
         let lookup = superblock.lookup(&client, ROOT_INODE_NO, name.as_ref()).await.unwrap();
-        let lookup_count = lookup.inode.inner.sync.read().unwrap().lookup_count;
+        let lookup_count = lookup.inode.inner.lookup_count.load(Ordering::SeqCst);
         assert_eq!(lookup_count, 1);
         let ino = lookup.inode.ino();
 
         superblock.forget(ino, 1);
 
-        let lookup_count = lookup.inode.inner.sync.read().unwrap().lookup_count;
+        let lookup_count = lookup.inode.inner.lookup_count.load(Ordering::SeqCst);
         assert_eq!(lookup_count, 0);
         // This test should now hold the only reference to the inode, so we know it's unreferenced
         // and will be freed
@@ -647,7 +702,7 @@ mod tests {
         assert!(matches!(err, InodeError::InodeDoesNotExist(_)));
 
         let lookup = superblock.lookup(&client, ROOT_INODE_NO, name.as_ref()).await.unwrap();
-        let lookup_count = lookup.inode.inner.sync.read().unwrap().lookup_count;
+        let lookup_count = lookup.inode.inner.lookup_count.load(Ordering::SeqCst);
         assert_eq!(lookup_count, 1);
     }
 
@@ -666,7 +721,7 @@ mod tests {
         let superblock = Superblock::new("test_bucket", &Default::default(), Default::default());
 
         let lookup = superblock.lookup(&client, ROOT_INODE_NO, name.as_ref()).await.unwrap();
-        let lookup_count = lookup.inode.inner.sync.read().unwrap().lookup_count;
+        let lookup_count = lookup.inode.inner.lookup_count.load(Ordering::SeqCst);
         assert_eq!(lookup_count, 1);
         let ino = lookup.inode.ino();
         drop(lookup);
@@ -709,20 +764,16 @@ mod tests {
                     .new_child(file_name.try_into().unwrap(), InodeKind::File)
                     .unwrap(),
                 checksum: bad_checksum,
-                sync: RwLock::new(InodeState {
-                    stat: InodeStat::for_file(
-                        0,
-                        OffsetDateTime::now_utc(),
-                        Some(ETag::for_tests().as_str().to_owned()),
-                        None,
-                        None,
-                        NEVER_EXPIRE_TTL,
-                    ),
-                    write_status: WriteStatus::Remote,
-                    kind_data: InodeKindData::File {},
-                    lookup_count: 1,
-                    reader_count: 0,
-                }),
+                sync: RwLock::new(InodeState::File(FileState::new(
+                    OffsetDateTime::now_utc(),
+                    WriteStatus::Remote,
+                    0,
+                    Some(ETag::for_tests().as_str().to_owned()),
+                    None,
+                    None,
+                    NEVER_EXPIRE_TTL,
+                ))),
+                lookup_count: AtomicU64::new(1),
             }),
         };
 
@@ -732,10 +783,10 @@ mod tests {
             inodes.insert(inode.ino(), inode.clone());
             let parent = inodes.get(&parent_ino).unwrap();
             let mut parent_state = parent.get_mut_inode_state().unwrap();
-            match &mut parent_state.kind_data {
-                InodeKindData::File {} => panic!("root is always a directory"),
-                InodeKindData::Directory { children, .. } => _ = children.insert(file_name.into(), inode.clone()),
-            }
+            let InodeState::Directory(dir_state) = parent_state.deref_mut() else {
+                panic!("root is always a directory");
+            };
+            dir_state.children.insert(file_name.into(), inode.clone());
         }
 
         let err = superblock
@@ -770,21 +821,24 @@ mod tests {
                     .new_child(inode_name.try_into().unwrap(), InodeKind::File)
                     .unwrap(),
                 checksum,
-                sync: RwLock::new(InodeState {
-                    write_status: WriteStatus::LocalOpen,
-                    stat: InodeStat::for_file(0, OffsetDateTime::UNIX_EPOCH, None, None, None, Default::default()),
-                    kind_data: InodeKindData::File {},
-                    lookup_count: 5,
-                    reader_count: 0,
-                }),
+                sync: RwLock::new(InodeState::File(FileState::new(
+                    OffsetDateTime::UNIX_EPOCH,
+                    WriteStatus::LocalOpen,
+                    0,
+                    None,
+                    None,
+                    None,
+                    Default::default(),
+                ))),
+                lookup_count: AtomicU64::new(5),
             }),
         };
         superblock.inner.inodes.write().unwrap().insert(ino, inode.clone());
 
         // Verify that the stat is invalid
         let inode = superblock.inner.get(ino).unwrap();
-        let stat = inode.get_inode_state().unwrap().stat.clone();
-        assert!(!stat.is_valid());
+        let stat_is_valid = inode.get_inode_state().unwrap().is_valid();
+        assert!(!stat_is_valid);
 
         // Should be able to reset expiry back and make stat valid when calling setattr
         let atime = OffsetDateTime::UNIX_EPOCH + Duration::days(90);
@@ -796,7 +850,7 @@ mod tests {
         let stat = lookup.stat;
         assert_eq!(stat.atime, atime);
         assert_eq!(stat.mtime, mtime);
-        assert!(stat.is_valid());
+        assert!(!stat.expiry.is_expired());
     }
 
     #[cfg(feature = "shuttle")]
@@ -823,7 +877,7 @@ mod tests {
                 let superblock = Arc::new(Superblock::new("test_bucket", &Default::default(), Default::default()));
 
                 let lookup = superblock.lookup(&client, ROOT_INODE_NO, name.as_ref()).await.unwrap();
-                let lookup_count = lookup.inode.inner.sync.read().unwrap().lookup_count;
+                let lookup_count = lookup.inode.inner.lookup_count.load(Ordering::SeqCst);
                 assert_eq!(lookup_count, 1);
                 let ino = lookup.inode.ino();
 
@@ -839,7 +893,7 @@ mod tests {
                     .unwrap();
 
                 forget_task.join().unwrap();
-                let lookup_count = lookup.inode.inner.sync.read().unwrap().lookup_count;
+                let lookup_count = lookup.inode.inner.lookup_count.load(Ordering::SeqCst);
                 assert_eq!(lookup_count, 0);
             }
 
