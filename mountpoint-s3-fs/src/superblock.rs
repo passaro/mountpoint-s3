@@ -153,13 +153,13 @@ impl Superblock {
             let InodeState::Directory(dir_state) = parent_state.deref_mut() else {
                 unreachable!("parent is always a directory");
             };
-            if let Some(child) = dir_state.children.get(inode.name()) {
+            if let Some(child) = dir_state.children.names.get(inode.name()) {
                 // Don't accidentally remove a newer inode (e.g. remote shadowing local)
                 if child.ino() == ino {
-                    dir_state.children.remove(inode.name());
+                    dir_state.children.names.remove(inode.name());
                 }
             }
-            dir_state.writing_children.remove(&ino);
+            dir_state.children.writing.remove(&ino);
 
             if let Ok(state) = inode.get_inode_state() {
                 metrics::counter!("metadata_cache.inode_forgotten_before_expiry").increment(state.is_valid().into());
@@ -341,7 +341,7 @@ impl Superblock {
             let InodeState::Directory(dir_state) = parent_state.deref_mut() else {
                 return Err(InodeError::NotADirectory(parent_inode.err()));
             };
-            if let Some(inode) = dir_state.children.get(name.as_ref()) {
+            if let Some(inode) = dir_state.children.names.get(name.as_ref()) {
                 return Err(InodeError::FileAlreadyExists(inode.err()));
             }
 
@@ -408,7 +408,7 @@ impl Superblock {
                 return Err(InodeError::CannotRemoveRemoteDirectory(inode.err()));
             }
             WriteStatus::LocalUnopened => {
-                if !dir_state.writing_children.is_empty() {
+                if !dir_state.children.writing.is_empty() {
                     return Err(InodeError::DirectoryNotEmpty(inode.err()));
                 }
                 dir_state.deleted = true;
@@ -419,12 +419,12 @@ impl Superblock {
             debug_assert!(false, "inodes never change kind");
             return Err(InodeError::NotADirectory(parent.err()));
         };
-        let removed = parent_dir_state.writing_children.remove(&inode.ino());
+        let removed = parent_dir_state.children.writing.remove(&inode.ino());
         debug_assert!(
             removed,
             "should be able to remove the directory from its parents writing children as it was local"
         );
-        parent_dir_state.children.remove(inode.name());
+        parent_dir_state.children.names.remove(inode.name());
 
         Ok(())
     }
@@ -503,6 +503,7 @@ impl Superblock {
         // Instead, we will panic when our assumption appears broken.
         let removed_inode = dir_state
             .children
+            .names
             .remove(inode.name())
             .expect("parent should contain child assuming VFS does not permit concurrent op on parent");
         assert_eq!(
@@ -596,7 +597,7 @@ impl SuperblockInner {
             let InodeState::Directory(dir_state) = &*parent.get_inode_state().ok()? else {
                 unreachable!("parent should be a directory!");
             };
-            if let Some(inode) = dir_state.children.get(name) {
+            if let Some(inode) = dir_state.children.names.get(name) {
                 let inode_state = &inode.get_inode_state().ok()?;
                 if inode_state.is_valid() {
                     let lookup = LookedUp {
@@ -791,7 +792,7 @@ impl SuperblockInner {
         let InodeState::Directory(dir_state) = &*parent_state else {
             unreachable!("we know parent is a directory");
         };
-        let inode = dir_state.children.get(name);
+        let inode = dir_state.children.names.get(name);
         match (remote, inode) {
             (None, None) => return Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err())),
             (Some(remote), Some(existing_inode)) => {
@@ -852,11 +853,11 @@ impl SuperblockInner {
         let InodeState::Directory(parent_dir_state) = parent_state.deref_mut() else {
             unreachable!("we know parent is a directory");
         };
-        let inode = parent_dir_state.children.get(name.as_ref()).cloned();
+        let inode = parent_dir_state.children.names.get(name.as_ref()).cloned();
         match (remote, inode) {
             (None, None) => Err(InodeError::FileDoesNotExist(name.to_string(), parent.err())),
             (None, Some(existing_inode)) => {
-                if parent_dir_state.writing_children.contains(&existing_inode.ino()) {
+                if parent_dir_state.children.writing.contains(&existing_inode.ino()) {
                     let mut sync = existing_inode.get_mut_inode_state()?;
                     self.update_validity(sync.deref_mut());
                     let stat = self.stat_for_inode(&sync);
@@ -870,7 +871,7 @@ impl SuperblockInner {
                     // This existing inode is local-only (because `remote` is None), but is not
                     // being written. It must have previously existed but been removed on the remote
                     // side.
-                    parent_dir_state.children.remove(name.as_ref());
+                    parent_dir_state.children.names.remove(name.as_ref());
                     Err(InodeError::FileDoesNotExist(name.to_string(), parent.err()))
                 }
             }
@@ -911,7 +912,7 @@ impl SuperblockInner {
                             if !existing_is_remote {
                                 trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "local directory has become remote");
                                 dir_state.write_status = WriteStatus::Remote;
-                                parent_dir_state.writing_children.remove(&existing_inode.ino());
+                                parent_dir_state.children.writing.remove(&existing_inode.ino());
                             }
                         }
                         (
@@ -988,12 +989,12 @@ impl SuperblockInner {
         let inode = Inode::new(next_ino, parent.ino(), key, &self.prefix, state, 0);
         trace!(parent=?inode.parent(), name=?inode.name(), kind=?inode.kind(), new_ino=?inode.ino(), key=?inode.key(), "created new inode");
 
-        let existing_inode = parent_locked.children.insert(name.to_string(), inode.clone());
+        let existing_inode = parent_locked.children.names.insert(name.to_string(), inode.clone());
         if is_new_file {
-            parent_locked.writing_children.insert(next_ino);
+            parent_locked.children.writing.insert(next_ino);
         }
         if let Some(existing_inode) = existing_inode {
-            parent_locked.writing_children.remove(&existing_inode.ino());
+            parent_locked.children.writing.remove(&existing_inode.ino());
         }
 
         Ok(inode)
@@ -1880,8 +1881,8 @@ mod tests {
         let InodeState::Directory(dir_state) = &*parent_state else {
             unreachable!("Parent can only be a Directory");
         };
-        assert!(!dir_state.writing_children.contains(&inode.ino()));
-        assert!(!dir_state.children.contains_key(inode.name()));
+        assert!(!dir_state.children.writing.contains(&inode.ino()));
+        assert!(!dir_state.children.names.contains_key(inode.name()));
 
         inode
             .get_inode_state()

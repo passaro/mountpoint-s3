@@ -263,18 +263,23 @@ pub(super) struct DirState {
 
     pub write_status: WriteStatus,
 
+    pub children: Box<Children>,
+
+    /// True if this directory has been deleted (`rmdir`) from its parent
+    pub deleted: bool,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct Children {
     /// Mapping from child names to previously seen [Inode]s.
     ///
     /// The existence of a child or lack thereof does not imply the object does not exist,
     /// nor that it currently exists in S3 in that state.
-    pub children: HashMap<String, Inode>,
+    pub names: HashMap<String, Inode>,
 
     /// A set of inode numbers that have been opened for write but not completed yet.
     /// This should be a subset of the [children](Self::Directory::children) field.
-    pub writing_children: HashSet<InodeNo>,
-
-    /// True if this directory has been deleted (`rmdir`) from its parent
-    pub deleted: bool,
+    pub writing: HashSet<InodeNo>,
 }
 
 impl InodeState {
@@ -317,7 +322,6 @@ impl DirState {
             expiry: Expiry::from_now(validity),
             write_status,
             children: Default::default(),
-            writing_children: Default::default(),
             deleted: false,
         }
     }
@@ -567,7 +571,7 @@ impl WriteHandle {
                     let InodeState::Directory(dir_state) = ancestor_state.deref_mut() else {
                         unreachable!("we know the ancestor is a directory");
                     };
-                    dir_state.writing_children.remove(&child_ino);
+                    dir_state.children.writing.remove(&child_ino);
                     dir_state.write_status = WriteStatus::Remote;
                 }
 
@@ -786,7 +790,7 @@ mod tests {
             let InodeState::Directory(dir_state) = parent_state.deref_mut() else {
                 panic!("root is always a directory");
             };
-            dir_state.children.insert(file_name.into(), inode.clone());
+            dir_state.children.names.insert(file_name.into(), inode.clone());
         }
 
         let err = superblock

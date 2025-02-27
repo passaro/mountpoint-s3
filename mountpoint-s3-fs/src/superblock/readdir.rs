@@ -77,7 +77,7 @@ impl ReaddirHandle {
                 return Err(InodeError::NotADirectory(inode.err()));
             };
 
-            let local_files = dir_state.writing_children.iter().map(|ino| {
+            let local_files = dir_state.children.writing.iter().map(|ino| {
                 let inode = inner.get(*ino)?;
                 let stat = inner.stat_for_inode(inode.get_inode_state()?.deref());
                 Ok(ReaddirEntry::LocalInode {
