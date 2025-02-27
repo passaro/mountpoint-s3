@@ -365,7 +365,7 @@ impl FileState {
     /// behalf so we might not see an attempted `open` call.
     fn is_readable(storage_class: Option<&str>, restore_status: Option<RestoreStatus>) -> bool {
         static HAS_SENT_WARNING: AtomicBool = AtomicBool::new(false);
-        match storage_class.as_deref() {
+        match storage_class {
             Some("GLACIER") | Some("DEEP_ARCHIVE") => {
                 let restored =
                     matches!(restore_status, Some(RestoreStatus::Restored { expiry }) if expiry > SystemTime::now());
@@ -379,8 +379,16 @@ impl FileState {
             _ => true,
         }
     }
-    
-    pub fn update_from_remote(&mut self, last_modified: OffsetDateTime, size: usize, etag: String, storage_class: Option<&str>, restore_status: Option<RestoreStatus>, validity: Duration) {
+
+    pub fn update_from_remote(
+        &mut self,
+        last_modified: OffsetDateTime,
+        size: usize,
+        etag: String,
+        storage_class: Option<&str>,
+        restore_status: Option<RestoreStatus>,
+        validity: Duration,
+    ) {
         self.expiry = Expiry::from_now(validity);
         self.write_status = WriteStatus::Remote;
         self.size = size;

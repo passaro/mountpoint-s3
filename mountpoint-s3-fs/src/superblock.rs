@@ -683,7 +683,7 @@ impl SuperblockInner {
                 result = file_lookup => {
                     match result {
                         Ok(HeadObjectResult { size, last_modified, restore_status, etag, storage_class, .. }) => {
-                            remote_lookup = Some(RemoteLookup::Object { size: size as usize, last_modified, etag: etag.as_str().to_string(), storage_class, restore_status });
+                            remote_lookup = Some(RemoteLookup::Object(ObjectLookup { size: size as usize, last_modified, etag: etag.as_str().to_string(), storage_class, restore_status }));
                         }
                         // If the object is not found, might be a directory, so keep going
                         Err(ObjectClientError::ServiceError(HeadObjectError::NotFound)) => {},
@@ -807,23 +807,14 @@ impl SuperblockInner {
                                 stat: self.stat_for_inode(&existing_state),
                             }));
                         }
-                        (
-                            RemoteLookup::Object {
-                                size,
-                                last_modified,
-                                etag,
-                                storage_class,
-                                restore_status,
-                            },
-                            InodeState::File(file_state),
-                        ) => {
+                        (RemoteLookup::Object(lookup), InodeState::File(file_state)) => {
                             trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place");
                             file_state.update_from_remote(
-                                *last_modified,
-                                *size,
-                                etag.clone(),
-                                storage_class.as_deref(),
-                                *restore_status,
+                                lookup.last_modified,
+                                lookup.size,
+                                lookup.etag.clone(),
+                                lookup.storage_class.as_deref(),
+                                lookup.restore_status,
                                 self.config.cache_config.file_ttl,
                             );
                             return Ok(Some(LookedUp {
@@ -915,23 +906,14 @@ impl SuperblockInner {
                                 parent_dir_state.children.writing.remove(&existing_inode.ino());
                             }
                         }
-                        (
-                            RemoteLookup::Object {
-                                size,
-                                last_modified,
-                                etag,
-                                storage_class,
-                                restore_status,
-                            },
-                            InodeState::File(file_state),
-                        ) => {
+                        (RemoteLookup::Object(lookup), InodeState::File(file_state)) => {
                             trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place");
                             file_state.update_from_remote(
-                                last_modified,
-                                size,
-                                etag.clone(),
-                                storage_class.as_deref(),
-                                restore_status,
+                                lookup.last_modified,
+                                lookup.size,
+                                lookup.etag,
+                                lookup.storage_class.as_deref(),
+                                lookup.restore_status,
                                 self.config.cache_config.file_ttl,
                             );
                         }
@@ -1035,22 +1017,20 @@ impl SuperblockInner {
             RemoteLookup::Prefix => {
                 InodeState::Directory(DirState::new(WriteStatus::Remote, self.config.cache_config.dir_ttl))
             }
-            RemoteLookup::Object {
-                size,
-                last_modified,
-                etag,
-                storage_class,
-                restore_status,
-            } => InodeState::File(FileState::new(
-                last_modified,
-                WriteStatus::Remote,
-                size,
-                Some(etag),
-                storage_class.as_deref(),
-                restore_status,
-                self.config.cache_config.file_ttl,
-            )),
+            RemoteLookup::Object(lookup) => InodeState::File(self.file_state_from_remote(lookup)),
         }
+    }
+
+    fn file_state_from_remote(&self, lookup: ObjectLookup) -> FileState {
+        FileState::new(
+            lookup.last_modified,
+            WriteStatus::Remote,
+            lookup.size,
+            Some(lookup.etag),
+            lookup.storage_class.as_deref(),
+            lookup.restore_status,
+            self.config.cache_config.file_ttl,
+        )
     }
 }
 
@@ -1058,13 +1038,16 @@ impl SuperblockInner {
 #[derive(Debug, Clone)]
 pub enum RemoteLookup {
     Prefix,
-    Object {
-        size: usize,
-        last_modified: OffsetDateTime,
-        etag: String,
-        storage_class: Option<String>,
-        restore_status: Option<RestoreStatus>,
-    },
+    Object(ObjectLookup),
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectLookup {
+    size: usize,
+    last_modified: OffsetDateTime,
+    etag: String,
+    storage_class: Option<String>,
+    restore_status: Option<RestoreStatus>,
 }
 
 impl RemoteLookup {
@@ -1078,7 +1061,7 @@ impl RemoteLookup {
     fn etag(&self) -> Option<&str> {
         match self {
             RemoteLookup::Prefix => None,
-            RemoteLookup::Object { etag, .. } => Some(etag),
+            RemoteLookup::Object(ObjectLookup { etag, .. }) => Some(etag),
         }
     }
 }

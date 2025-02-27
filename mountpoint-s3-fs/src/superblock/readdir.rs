@@ -50,7 +50,7 @@ use tracing::{error, trace, warn};
 
 use crate::sync::{Arc, AsyncMutex, Mutex};
 
-use super::{InodeError, InodeKind, InodeNo, InodeState, LookedUp, RemoteLookup, SuperblockInner};
+use super::{InodeError, InodeKind, InodeNo, InodeState, LookedUp, ObjectLookup, RemoteLookup, SuperblockInner};
 
 /// Handle for an inflight directory listing
 #[derive(Debug)]
@@ -168,13 +168,13 @@ impl ReaddirHandle {
             // have been deduplicated by now.
             ReaddirEntry::LocalInode { .. } => None,
             ReaddirEntry::RemotePrefix { .. } => Some(RemoteLookup::Prefix),
-            ReaddirEntry::RemoteObject { object_info, .. } => Some(RemoteLookup::Object {
+            ReaddirEntry::RemoteObject { object_info, .. } => Some(RemoteLookup::Object(ObjectLookup {
                 size: object_info.size as usize,
                 last_modified: object_info.last_modified,
                 etag: object_info.etag.clone(),
                 storage_class: object_info.storage_class.clone(),
                 restore_status: object_info.restore_status,
-            }),
+            })),
         }
     }
 
