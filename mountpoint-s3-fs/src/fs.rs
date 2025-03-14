@@ -46,7 +46,7 @@ mod sse;
 pub use sse::{ServerSideEncryption, SseCorruptedError};
 
 mod time_to_live;
-pub use time_to_live::TimeToLive;
+pub use time_to_live::{ShortDuration, TimeToLive};
 
 pub const FUSE_ROOT_INODE: InodeNo = 1u64;
 

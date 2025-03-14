@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Debug;
 use std::ops::DerefMut;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use futures::{select_biased, FutureExt};
@@ -47,6 +47,7 @@ use crate::sync::{Arc, RwLock};
 
 mod expiry;
 use expiry::Expiry;
+pub use expiry::{ShortDuration, Timeline};
 
 mod inode;
 use inode::{DirState, FileState, InodeErrorInfo, InodeStat, InodeState, WriteStatus};
@@ -76,6 +77,7 @@ struct SuperblockInner {
     next_ino: AtomicU64,
     mount_time: OffsetDateTime,
     config: SuperblockConfig,
+    timeline: Timeline,
 }
 
 /// Configuration for superblock operations
@@ -89,6 +91,7 @@ impl Superblock {
     /// Create a new Superblock that targets the given bucket/prefix
     pub fn new(bucket: &str, prefix: &Prefix, config: SuperblockConfig) -> Self {
         let mount_time = OffsetDateTime::now_utc();
+        let timeline = Timeline::new_from_now();
         let root = Inode::new_root(prefix);
 
         let root_ino = root.ino();
@@ -98,6 +101,7 @@ impl Superblock {
         let negative_cache = NegativeCache::new(
             config.cache_config.negative_cache_size,
             config.cache_config.negative_cache_ttl,
+            timeline.clone(),
         );
 
         let inner = SuperblockInner {
@@ -108,6 +112,7 @@ impl Superblock {
             next_ino: AtomicU64::new(root_ino + 1),
             mount_time,
             config,
+            timeline,
         };
         Self { inner: Arc::new(inner) }
     }
@@ -161,9 +166,8 @@ impl Superblock {
             }
             dir_state.children.writing.remove(&ino);
 
-            if let Ok(state) = inode.get_inode_state() {
-                metrics::counter!("metadata_cache.inode_forgotten_before_expiry").increment(state.is_valid().into());
-            };
+            let valid = self.inner.timeline.is_valid(inode.expiry());
+            metrics::counter!("metadata_cache.inode_forgotten_before_expiry").increment(valid.into());
         }
     }
 
@@ -200,9 +204,10 @@ impl Superblock {
         logging::record_name(inode.name());
 
         if !force_revalidate {
-            let sync = inode.get_inode_state()?;
-            if sync.is_valid() {
-                let stat = self.inner.stat_for_inode(&sync);
+            let expiry = inode.expiry();
+            if self.inner.timeline.is_valid(expiry) {
+                let sync = inode.get_inode_state()?;
+                let stat = self.inner.stat_for_inode(&sync, expiry);
                 drop(sync);
                 return Ok(LookedUp { inode, stat });
             }
@@ -239,9 +244,6 @@ impl Superblock {
             return Err(InodeError::SetAttrNotPermittedOnRemoteInode(inode.err()));
         }
 
-        // Resetting the InodeStat expiry because the new InodeStat should have new validity
-        self.inner.update_validity(sync.deref_mut());
-
         if let InodeState::File(file_state) = sync.deref_mut() {
             if let Some(t) = atime {
                 file_state.atime = t;
@@ -251,7 +253,11 @@ impl Superblock {
             };
         }
 
-        let stat = self.inner.stat_for_inode(&sync);
+        // Resetting the InodeStat expiry because the new InodeStat should have new validity
+        let expiry = self.inner.expiry_for_kind(inode.kind());
+        inode.update_validity(expiry);
+
+        let stat = self.inner.stat_for_inode(&sync, expiry);
         drop(sync);
         Ok(LookedUp { inode, stat })
     }
@@ -354,18 +360,11 @@ impl Superblock {
                     None,
                     None,
                     None,
-                    self.inner.config.cache_config.file_ttl,
                 )),
-                InodeKind::Directory => InodeState::Directory(DirState::new(
-                    WriteStatus::LocalUnopened,
-                    self.inner.config.cache_config.dir_ttl,
-                )),
+                InodeKind::Directory => InodeState::Directory(DirState::new(WriteStatus::LocalUnopened)),
             };
-            let stat = self.inner.stat_for_inode(&state);
-            let inode = self
-                .inner
-                .create_inode_locked(&parent_inode, dir_state, name, state, true)?;
-            LookedUp { inode, stat }
+            self.inner
+                .create_inode_locked(&parent_inode, dir_state, name, state, true)?
         };
 
         self.inner.remember(&lookup.inode);
@@ -598,12 +597,12 @@ impl SuperblockInner {
                 unreachable!("parent should be a directory!");
             };
             if let Some(inode) = dir_state.children.names.get(name) {
-                let inode_state = &inode.get_inode_state().ok()?;
-                if inode_state.is_valid() {
-                    let lookup = LookedUp {
-                        inode: inode.clone(),
-                        stat: superblock.stat_for_inode(inode_state),
-                    };
+                let expiry = inode.expiry();
+                if superblock.timeline.is_valid(expiry) {
+                    let inode_state = &inode.get_inode_state().ok()?;
+                    let stat = superblock.stat_for_inode(inode_state, expiry);
+                    let inode = inode.clone();
+                    let lookup = LookedUp { inode, stat };
                     return Some(Ok(lookup));
                 }
             }
@@ -798,13 +797,14 @@ impl SuperblockInner {
             (Some(remote), Some(existing_inode)) => {
                 let mut existing_state = existing_inode.get_mut_inode_state()?;
                 if existing_state.is_remote() {
+                    let expiry = self.expiry_for_kind(existing_state.kind());
+                    existing_inode.update_validity(expiry);
                     match (remote, existing_state.deref_mut()) {
-                        (RemoteLookup::Prefix, InodeState::Directory(dir_state)) => {
+                        (RemoteLookup::Prefix, InodeState::Directory(_)) => {
                             trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place");
-                            dir_state.expiry = Expiry::from_now(self.config.cache_config.dir_ttl);
                             return Ok(Some(LookedUp {
                                 inode: existing_inode.clone(),
-                                stat: self.stat_for_inode(&existing_state),
+                                stat: self.stat_for_inode(&existing_state, expiry),
                             }));
                         }
                         (RemoteLookup::Object(lookup), InodeState::File(file_state)) => {
@@ -819,7 +819,7 @@ impl SuperblockInner {
                             );
                             return Ok(Some(LookedUp {
                                 inode: existing_inode.clone(),
-                                stat: self.stat_for_inode(&existing_state),
+                                stat: self.stat_for_inode(&existing_state, expiry),
                             }));
                         }
                         _ => {}
@@ -849,11 +849,11 @@ impl SuperblockInner {
             (None, None) => Err(InodeError::FileDoesNotExist(name.to_string(), parent.err())),
             (None, Some(existing_inode)) => {
                 if parent_dir_state.children.writing.contains(&existing_inode.ino()) {
-                    let mut sync = existing_inode.get_mut_inode_state()?;
-                    self.update_validity(sync.deref_mut());
-                    let stat = self.stat_for_inode(&sync);
+                    let expiry = self.expiry_for_kind(existing_inode.kind());
+                    existing_inode.update_validity(expiry);
+                    let sync = existing_inode.get_mut_inode_state()?;
+                    let stat = self.stat_for_inode(&sync, expiry);
                     drop(sync);
-
                     Ok(LookedUp {
                         inode: existing_inode,
                         stat,
@@ -868,11 +868,11 @@ impl SuperblockInner {
             }
             (Some(remote), None) => {
                 let state = self.inode_state_from_remote(remote);
-                let stat = self.stat_for_inode(&state);
                 self.create_inode_locked(&parent, parent_dir_state, name, state, false)
-                    .map(|inode| LookedUp { inode, stat })
             }
             (Some(remote), Some(existing_inode)) => {
+                let expiry = self.expiry_for_kind(existing_inode.kind());
+
                 // We need to reconcile the existing state with the state we just got from the
                 // remote. Our goal here is for the behavior to be as unsurprising as possible while
                 // being consistent with our stated semantics about implicit directories and how
@@ -885,7 +885,7 @@ impl SuperblockInner {
                 if remote.kind() == InodeKind::File && !existing_is_remote {
                     return Ok(LookedUp {
                         inode: existing_inode.clone(),
-                        stat: self.stat_for_inode(&existing_state),
+                        stat: self.stat_for_inode(&existing_state, expiry),
                     });
                 }
 
@@ -896,10 +896,10 @@ impl SuperblockInner {
                 let same_etag = existing_state.etag() == remote.etag();
                 if same_kind && same_etag && (existing_is_remote || remote.kind() == InodeKind::Directory) {
                     trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place (slow path)");
+                    existing_inode.update_validity(expiry);
                     match (remote, existing_state.deref_mut()) {
                         (RemoteLookup::Prefix, InodeState::Directory(dir_state)) => {
                             trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place");
-                            dir_state.expiry = Expiry::from_now(self.config.cache_config.dir_ttl);
                             if !existing_is_remote {
                                 trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "local directory has become remote");
                                 dir_state.write_status = WriteStatus::Remote;
@@ -921,7 +921,7 @@ impl SuperblockInner {
                     }
                     return Ok(LookedUp {
                         inode: existing_inode.clone(),
-                        stat: self.stat_for_inode(&existing_state),
+                        stat: self.stat_for_inode(&existing_state, expiry),
                     });
                 }
 
@@ -944,9 +944,7 @@ impl SuperblockInner {
                     "inode needs to be recreated",
                 );
                 let state = self.inode_state_from_remote(remote);
-                let stat = self.stat_for_inode(&state);
-                let new_inode = self.create_inode_locked(&parent, parent_dir_state, name, state, false)?;
-                Ok(LookedUp { inode: new_inode, stat })
+                self.create_inode_locked(&parent, parent_dir_state, name, state, false)
             }
         }
     }
@@ -962,13 +960,15 @@ impl SuperblockInner {
         name: ValidName,
         state: InodeState,
         is_new_file: bool,
-    ) -> Result<Inode, InodeError> {
+    ) -> Result<LookedUp, InodeError> {
+        let expiry = self.expiry_for_kind(state.kind());
+        let stat = self.stat_for_inode(&state, expiry);
         let key = parent
             .valid_key()
             .new_child(name, state.kind())
             .map_err(|_| InodeError::NotADirectory(parent.err()))?;
         let next_ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
-        let inode = Inode::new(next_ino, parent.ino(), key, &self.prefix, state, 0);
+        let inode = Inode::new(next_ino, parent.ino(), key, &self.prefix, state, expiry, 0);
         trace!(parent=?inode.parent(), name=?inode.name(), kind=?inode.kind(), new_ino=?inode.ino(), key=?inode.key(), "created new inode");
 
         let existing_inode = parent_locked.children.names.insert(name.to_string(), inode.clone());
@@ -979,20 +979,22 @@ impl SuperblockInner {
             parent_locked.children.writing.remove(&existing_inode.ino());
         }
 
-        Ok(inode)
+        Ok(LookedUp { inode, stat })
     }
 
-    fn update_validity(&self, state: &mut InodeState) {
-        match state {
-            InodeState::File(file_state) => file_state.update_validity(self.config.cache_config.file_ttl),
-            InodeState::Directory(dir_state) => dir_state.update_validity(self.config.cache_config.dir_ttl),
-        }
+    fn expiry_for_kind(&self, kind: InodeKind) -> Expiry {
+        let ttl = match kind {
+            InodeKind::File => self.config.cache_config.file_ttl,
+            InodeKind::Directory => self.config.cache_config.dir_ttl,
+        };
+        self.timeline.expiry_from_now(ttl)
     }
 
-    fn stat_for_inode(&self, inode_state: &InodeState) -> InodeStat {
+    fn stat_for_inode(&self, inode_state: &InodeState, expiry: Expiry) -> InodeStat {
+        let expiry = self.timeline.expiry_instant(expiry);
         match inode_state {
             InodeState::File(file_state) => InodeStat {
-                expiry: file_state.expiry,
+                expiry,
                 size: file_state.size,
                 atime: file_state.atime,
                 ctime: file_state.ctime,
@@ -1000,8 +1002,8 @@ impl SuperblockInner {
                 etag: file_state.etag.clone(),
                 is_readable: file_state.is_readable,
             },
-            InodeState::Directory(dir_state) => InodeStat {
-                expiry: dir_state.expiry,
+            InodeState::Directory(_) => InodeStat {
+                expiry,
                 size: 0,
                 mtime: self.mount_time,
                 ctime: self.mount_time,
@@ -1014,9 +1016,7 @@ impl SuperblockInner {
 
     fn inode_state_from_remote(&self, remote: RemoteLookup) -> InodeState {
         match remote {
-            RemoteLookup::Prefix => {
-                InodeState::Directory(DirState::new(WriteStatus::Remote, self.config.cache_config.dir_ttl))
-            }
+            RemoteLookup::Prefix => InodeState::Directory(DirState::new(WriteStatus::Remote)),
             RemoteLookup::Object(lookup) => InodeState::File(self.file_state_from_remote(lookup)),
         }
     }
@@ -1029,7 +1029,6 @@ impl SuperblockInner {
             Some(lookup.etag),
             lookup.storage_class.as_deref(),
             lookup.restore_status,
-            self.config.cache_config.file_ttl,
         )
     }
 }
@@ -1078,7 +1077,7 @@ pub struct LookedUp {
 impl LookedUp {
     /// How much longer this lookup will be valid for
     pub fn validity(&self) -> Duration {
-        self.stat.expiry.remaining_ttl()
+        self.stat.expiry.saturating_duration_since(Instant::now())
     }
 }
 
@@ -1368,9 +1367,9 @@ mod tests {
 
         let prefix = Prefix::new(prefix).expect("valid prefix");
         let ttl = if cached {
-            std::time::Duration::from_secs(60 * 60 * 24 * 7) // 7 days should be enough
+            ShortDuration::from_secs(60 * 60 * 24 * 7) // 7 days should be enough
         } else {
-            std::time::Duration::ZERO
+            ShortDuration::ZERO
         };
         let superblock = Superblock::new(
             bucket,
@@ -1418,9 +1417,9 @@ mod tests {
 
         let prefix = Prefix::new(prefix).expect("valid prefix");
         let ttl = if cached {
-            std::time::Duration::from_secs(60 * 60 * 24 * 7) // 7 days should be enough
+            ShortDuration::from_secs(60 * 60 * 24 * 7) // 7 days should be enough
         } else {
-            std::time::Duration::ZERO
+            ShortDuration::ZERO
         };
         let superblock = Superblock::new(
             bucket,

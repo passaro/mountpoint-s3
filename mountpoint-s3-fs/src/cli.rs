@@ -39,6 +39,7 @@ use crate::mem_limiter::MINIMUM_MEM_LIMIT;
 use crate::prefetch::{caching_prefetch, default_prefetch, Prefetch};
 use crate::prefix::Prefix;
 use crate::s3::S3Personality;
+use crate::superblock::ShortDuration;
 use crate::{autoconfigure, metrics, S3Filesystem, S3FilesystemConfig};
 
 const CLIENT_OPTIONS_HEADER: &str = "Client options";
@@ -939,12 +940,12 @@ where
     let mut metadata_cache_ttl = args.metadata_ttl.unwrap_or_else(|| {
         if args.cache.is_some() || args.cache_express_bucket_name().is_some() {
             // When the data cache is enabled, use 1min as metadata-ttl.
-            TimeToLive::Duration(Duration::from_secs(60))
+            TimeToLive::Duration(ShortDuration::from_secs(60))
         } else {
             TimeToLive::Minimal
         }
     });
-    if matches!(metadata_cache_ttl, TimeToLive::Duration(Duration::ZERO)) {
+    if matches!(metadata_cache_ttl, TimeToLive::Duration(ShortDuration::ZERO)) {
         const ZERO_TTL_WARNING: &str = "The '--metadata-ttl 0' setting is no longer supported, is now interpreted as 'minimal', and will be removed in a future release. Use '--metadata-ttl minimal' instead";
         tracing::warn!("{}", ZERO_TTL_WARNING);
         if !args.foreground {

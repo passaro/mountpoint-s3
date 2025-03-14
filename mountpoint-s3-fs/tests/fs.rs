@@ -192,7 +192,7 @@ async fn test_read_dir_nested(prefix: &str) {
 #[tokio::test]
 async fn test_lookup_negative_cached() {
     let fs_config = S3FilesystemConfig {
-        cache_config: CacheConfig::new(TimeToLive::Duration(Duration::from_secs(600))),
+        cache_config: CacheConfig::new(TimeToLive::from_secs(600).unwrap()),
         ..Default::default()
     };
     let (client, fs) = make_test_filesystem("test_lookup_negative_cached", &Default::default(), fs_config);
@@ -258,7 +258,7 @@ async fn test_lookup_negative_cached() {
 #[tokio::test]
 async fn test_lookup_then_open_cached() {
     let fs_config = S3FilesystemConfig {
-        cache_config: CacheConfig::new(TimeToLive::Duration(Duration::from_secs(600))),
+        cache_config: CacheConfig::new(TimeToLive::from_secs(600).unwrap()),
         ..Default::default()
     };
     let (client, fs) = make_test_filesystem("test_lookup_then_open_cached", &Default::default(), fs_config);
@@ -316,7 +316,7 @@ async fn test_lookup_then_open_no_cache() {
 #[tokio::test]
 async fn test_readdir_then_open_cached() {
     let fs_config = S3FilesystemConfig {
-        cache_config: CacheConfig::new(TimeToLive::Duration(Duration::from_secs(600))),
+        cache_config: CacheConfig::new(TimeToLive::from_secs(600).unwrap()),
         ..Default::default()
     };
     let (client, fs) = make_test_filesystem("test_readdir_then_open_cached", &Default::default(), fs_config);
@@ -362,7 +362,7 @@ async fn test_readdir_then_open_cached() {
 #[tokio::test]
 async fn test_unlink_cached() {
     let fs_config = S3FilesystemConfig {
-        cache_config: CacheConfig::new(TimeToLive::Duration(Duration::from_secs(600))),
+        cache_config: CacheConfig::new(TimeToLive::from_secs(600).unwrap()),
         allow_delete: true,
         ..Default::default()
     };
@@ -407,7 +407,7 @@ async fn test_unlink_cached() {
 async fn test_mknod_cached() {
     const BUCKET_NAME: &str = "test_mknod_cached";
     let fs_config = S3FilesystemConfig {
-        cache_config: CacheConfig::new(TimeToLive::Duration(Duration::from_secs(600))),
+        cache_config: CacheConfig::new(TimeToLive::from_secs(600).unwrap()),
         ..Default::default()
     };
     let (client, fs) = make_test_filesystem(BUCKET_NAME, &Default::default(), fs_config);

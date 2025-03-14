@@ -1,13 +1,15 @@
-use std::{fmt::Display, num::ParseIntError, str::FromStr, time::Duration};
+use std::{fmt::Display, num::ParseIntError, str::FromStr};
 
 use thiserror::Error;
+
+pub use crate::superblock::ShortDuration;
 
 /// User-configurable time-to-live (TTL) for metadata caching.
 #[derive(Debug, Clone, Copy)]
 pub enum TimeToLive {
     Minimal,
     Indefinite,
-    Duration(Duration),
+    Duration(ShortDuration),
 }
 
 #[derive(Error, Debug)]
@@ -31,7 +33,7 @@ impl TimeToLive {
     const MAXIMUM_TTL_YEARS: u64 = 100;
     const MAXIMUM_TTL_SECONDS: u64 = Self::MAXIMUM_TTL_YEARS * 365 * 24 * 60 * 60;
 
-    pub const INDEFINITE_DURATION: Duration = Duration::from_secs(Self::MAXIMUM_TTL_SECONDS);
+    pub const INDEFINITE_DURATION: ShortDuration = ShortDuration::from_secs(Self::MAXIMUM_TTL_SECONDS);
 
     pub fn new_from_str(s: &str) -> Result<Self, TimeToLiveError> {
         match s {
@@ -39,14 +41,18 @@ impl TimeToLive {
             Self::INDEFINITE => Ok(Self::Indefinite),
             _ => {
                 let seconds = s.parse()?;
-                if seconds > Self::MAXIMUM_TTL_SECONDS {
-                    return Err(TimeToLiveError::TooLarge);
-                }
-
-                let duration = Duration::from_secs(seconds);
-                Ok(Self::Duration(duration))
+                Self::from_secs(seconds)
             }
         }
+    }
+
+    pub fn from_secs(seconds: u64) -> Result<Self, TimeToLiveError> {
+        if seconds > Self::MAXIMUM_TTL_SECONDS {
+            return Err(TimeToLiveError::TooLarge);
+        }
+
+        let duration = ShortDuration::from_secs(seconds);
+        Ok(Self::Duration(duration))
     }
 }
 

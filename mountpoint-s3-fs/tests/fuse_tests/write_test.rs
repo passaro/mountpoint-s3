@@ -12,7 +12,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use test_case::{test_case, test_matrix};
 
-use mountpoint_s3_fs::fs::CacheConfig;
+use mountpoint_s3_fs::fs::{CacheConfig, ShortDuration};
 use mountpoint_s3_fs::S3FilesystemConfig;
 #[cfg(all(feature = "s3_tests", not(feature = "s3express_tests")))]
 use mountpoint_s3_fs::ServerSideEncryption;
@@ -435,7 +435,7 @@ fn fstat_after_writing(creator_fn: impl TestSessionCreator, sync_mode: FSyncMode
     const OBJECT_SIZE: usize = 32;
     const KEY: &str = "new.txt";
 
-    let file_ttl = Duration::from_millis(50); // keep short for fast tests...
+    let file_ttl = ShortDuration::from_millis(50); // keep short for fast tests...
     let filesystem_config = S3FilesystemConfig {
         cache_config: CacheConfig {
             file_ttl,
@@ -465,6 +465,7 @@ fn fstat_after_writing(creator_fn: impl TestSessionCreator, sync_mode: FSyncMode
     let stat = f.metadata().expect("fstat should succeed after writing");
     assert_eq!(stat.len(), OBJECT_SIZE as u64);
 
+    let file_ttl: Duration = file_ttl.into();
     if sync_mode.on() {
         f.sync_all().expect("fsync should succeed since it's the first fsync");
 

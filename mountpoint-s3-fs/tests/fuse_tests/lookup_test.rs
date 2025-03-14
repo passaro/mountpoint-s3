@@ -1,14 +1,9 @@
 use std::fs::OpenOptions;
+use std::fs::{metadata, read_dir, read_to_string};
 use std::io::Write;
-use std::{
-    fs::{metadata, read_dir, read_to_string},
-    time::Duration,
-};
 
-use mountpoint_s3_fs::{
-    fs::{CacheConfig, TimeToLive},
-    S3FilesystemConfig,
-};
+use mountpoint_s3_fs::fs::{CacheConfig, ShortDuration, TimeToLive};
+use mountpoint_s3_fs::S3FilesystemConfig;
 use test_case::test_case;
 
 use crate::common::fuse::{self, read_dir_to_entry_names, TestSessionConfig, TestSessionCreator};
@@ -107,9 +102,9 @@ fn lookup_previously_shadowed_file_test(creator_fn: impl TestSessionCreator) {
     let filesystem_config = S3FilesystemConfig {
         cache_config: CacheConfig {
             serve_lookup_from_cache: false,
-            file_ttl: Duration::ZERO,
-            dir_ttl: Duration::ZERO,
-            negative_cache_ttl: Duration::ZERO,
+            file_ttl: ShortDuration::ZERO,
+            dir_ttl: ShortDuration::ZERO,
+            negative_cache_ttl: ShortDuration::ZERO,
             ..Default::default()
         },
         ..Default::default()
@@ -198,7 +193,7 @@ fn lookup_with_negative_cache(creator_fn: impl TestSessionCreator) {
     const FILE_NAME: &str = "hello.txt";
     let config = TestSessionConfig {
         filesystem_config: S3FilesystemConfig {
-            cache_config: CacheConfig::new(TimeToLive::Duration(Duration::from_secs(600))),
+            cache_config: CacheConfig::new(TimeToLive::from_secs(600).unwrap()),
             ..Default::default()
         },
         ..Default::default()
@@ -232,11 +227,11 @@ fn lookup_with_negative_cache_mock() {
     lookup_with_negative_cache(fuse::mock_session::new);
 }
 
-fn lookup_with_negative_cache_ttl(creator_fn: impl TestSessionCreator, ttl: Duration) {
+fn lookup_with_negative_cache_ttl(creator_fn: impl TestSessionCreator, ttl: ShortDuration) {
     const FILE_NAME: &str = "hello.txt";
     let config = TestSessionConfig {
         filesystem_config: S3FilesystemConfig {
-            cache_config: CacheConfig::new(TimeToLive::Duration(Duration::from_secs(600)))
+            cache_config: CacheConfig::new(TimeToLive::from_secs(600).unwrap())
                 .with_negative_metadata_ttl(TimeToLive::Duration(ttl)),
             ..Default::default()
         },
@@ -250,7 +245,7 @@ fn lookup_with_negative_cache_ttl(creator_fn: impl TestSessionCreator, ttl: Dura
     test_session.client().put_object(FILE_NAME, b"hello").unwrap();
     metadata(&file_path).expect_err("should fail as mountpoint should use negative cache");
 
-    std::thread::sleep(ttl);
+    std::thread::sleep(ttl.into());
 
     let m = metadata(&file_path).expect("should succeed as the ttl has expired");
     assert!(m.file_type().is_file());
@@ -259,10 +254,10 @@ fn lookup_with_negative_cache_ttl(creator_fn: impl TestSessionCreator, ttl: Dura
 #[cfg(feature = "s3_tests")]
 #[test]
 fn lookup_with_negative_cache_ttl_s3() {
-    lookup_with_negative_cache_ttl(fuse::s3_session::new, Duration::from_secs(5));
+    lookup_with_negative_cache_ttl(fuse::s3_session::new, ShortDuration::from_secs(5));
 }
 
 #[test]
 fn lookup_with_negative_cache_ttl_mock() {
-    lookup_with_negative_cache_ttl(fuse::mock_session::new, Duration::from_secs(1));
+    lookup_with_negative_cache_ttl(fuse::mock_session::new, ShortDuration::from_secs(1));
 }

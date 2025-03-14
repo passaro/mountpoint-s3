@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::ops::DerefMut;
-use std::time::{Duration, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use fuser::FileType;
 use mountpoint_s3_client::checksums::crc32c::{self, Crc32c};
@@ -13,6 +13,7 @@ use crate::prefix::Prefix;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use super::expiry::AtomicExpiry;
 use super::path::ValidKey;
 use super::{Expiry, InodeError, SuperblockInner};
 
@@ -25,9 +26,6 @@ pub struct Inode {
 
 const ROOT_INODE_NO: InodeNo = crate::fs::FUSE_ROOT_INODE;
 
-// 200 years seems long enough
-const NEVER_EXPIRE_TTL: Duration = Duration::from_secs(200 * 365 * 24 * 60 * 60);
-
 #[derive(Debug)]
 struct InodeInner {
     // Immutable inode state -- any changes to these requires a new inode
@@ -39,6 +37,9 @@ struct InodeInner {
     /// Number of references the kernel is holding to the [Inode].
     /// A number of FS operations increment this, while the kernel calls [`Inode::forget(ino, n)`] to decrement.
     lookup_count: AtomicU64,
+
+    /// Time this stat becomes invalid and needs to be refreshed
+    expiry: AtomicExpiry,
 
     /// Mutable inode state. This lock should also be held to serialize operations on an inode (like
     /// creating a new child).
@@ -76,6 +77,14 @@ impl Inode {
 
     pub fn valid_key(&self) -> &ValidKey {
         &self.inner.valid_key
+    }
+
+    pub fn expiry(&self) -> Expiry {
+        self.inner.expiry.load(Ordering::SeqCst)
+    }
+
+    pub fn update_validity(&self, expiry: Expiry) {
+        self.inner.expiry.store(expiry, Ordering::SeqCst);
     }
 
     /// Increment lookup count for [Inode] by 1, returning the new value.
@@ -139,6 +148,7 @@ impl Inode {
         key: ValidKey,
         prefix: &Prefix,
         state: InodeState,
+        expiry: Expiry,
         lookup_count: u64,
     ) -> Self {
         let checksum = Self::compute_checksum(ino, prefix, key.as_ref());
@@ -149,6 +159,7 @@ impl Inode {
             valid_key: key,
             checksum,
             lookup_count: AtomicU64::new(lookup_count),
+            expiry: AtomicExpiry::new(expiry),
             sync,
         };
         Self { inner: inner.into() }
@@ -163,7 +174,8 @@ impl Inode {
             prefix,
             // The root inode never expires because there's no remote to consult for its
             // metadata, and it always exists.
-            InodeState::Directory(DirState::new(WriteStatus::Remote, NEVER_EXPIRE_TTL)),
+            InodeState::Directory(DirState::new(WriteStatus::Remote)),
+            Expiry::NEVER,
             1,
         )
     }
@@ -232,9 +244,6 @@ pub(super) enum InodeState {
 
 #[derive(Debug)]
 pub(super) struct FileState {
-    /// Time this stat becomes invalid and needs to be refreshed
-    pub expiry: Expiry,
-
     /// Size in bytes
     pub size: usize,
 
@@ -258,9 +267,6 @@ pub(super) struct FileState {
 
 #[derive(Debug)]
 pub(super) struct DirState {
-    /// Time this stat becomes invalid and needs to be refreshed
-    pub expiry: Expiry,
-
     pub write_status: WriteStatus,
 
     pub children: Box<Children>,
@@ -303,31 +309,15 @@ impl InodeState {
             InodeState::Directory(_) => None,
         }
     }
-
-    pub fn expiry(&self) -> &Expiry {
-        match self {
-            InodeState::File(file_state) => &file_state.expiry,
-            InodeState::Directory(dir_state) => &dir_state.expiry,
-        }
-    }
-
-    pub fn is_valid(&self) -> bool {
-        !self.expiry().is_expired()
-    }
 }
 
 impl DirState {
-    pub fn new(write_status: WriteStatus, validity: Duration) -> Self {
+    pub fn new(write_status: WriteStatus) -> Self {
         Self {
-            expiry: Expiry::from_now(validity),
             write_status,
             children: Default::default(),
             deleted: false,
         }
-    }
-
-    pub fn update_validity(&mut self, validity: Duration) {
-        self.expiry = Expiry::from_now(validity);
     }
 }
 
@@ -339,11 +329,9 @@ impl FileState {
         etag: Option<String>,
         storage_class: Option<&str>,
         restore_status: Option<RestoreStatus>,
-        validity: Duration,
     ) -> Self {
         let is_readable = Self::is_readable(storage_class, restore_status);
         Self {
-            expiry: Expiry::from_now(validity),
             write_status,
             size,
             etag,
@@ -353,10 +341,6 @@ impl FileState {
             is_readable,
             reader_count: 0,
         }
-    }
-
-    pub fn update_validity(&mut self, validity: Duration) {
-        self.expiry = Expiry::from_now(validity);
     }
 
     /// Objects in flexible retrieval storage classes can't be accessed via GetObject unless they are
@@ -427,7 +411,7 @@ impl From<InodeKind> for FileType {
 #[derive(Debug, Clone)]
 pub struct InodeStat {
     /// Time this stat becomes invalid and needs to be refreshed
-    pub expiry: Expiry,
+    pub expiry: Instant,
 
     /// Size in bytes
     pub size: usize,
@@ -569,7 +553,7 @@ impl WriteHandle {
                 file_state.etag = etag.map(|e| e.into_inner());
 
                 // Invalidate the inode's stats so we refresh them from S3 when next queried
-                file_state.update_validity(Duration::from_secs(0));
+                self.inode.update_validity(Expiry::EXPIRED);
 
                 // Walk up the ancestors from parent to first remote ancestor to transition
                 // the inode and all "local" containing directories to "remote".
@@ -653,8 +637,8 @@ mod tests {
                 None,
                 None,
                 None,
-                Default::default(),
             )),
+            Expiry::EXPIRED,
             5,
         );
         superblock.inner.inodes.write().unwrap().insert(ino, inode.clone());
@@ -783,9 +767,9 @@ mod tests {
                     Some(ETag::for_tests().as_str().to_owned()),
                     None,
                     None,
-                    NEVER_EXPIRE_TTL,
                 ))),
                 lookup_count: AtomicU64::new(1),
+                expiry: AtomicExpiry::new(Expiry::NEVER),
             }),
         };
 
@@ -840,17 +824,17 @@ mod tests {
                     None,
                     None,
                     None,
-                    Default::default(),
                 ))),
                 lookup_count: AtomicU64::new(5),
+                expiry: AtomicExpiry::new(Expiry::NEVER),
             }),
         };
         superblock.inner.inodes.write().unwrap().insert(ino, inode.clone());
 
         // Verify that the stat is invalid
         let inode = superblock.inner.get(ino).unwrap();
-        let stat_is_valid = inode.get_inode_state().unwrap().is_valid();
-        assert!(!stat_is_valid);
+        let is_valid = superblock.inner.timeline.is_valid(inode.expiry());
+        assert!(!is_valid);
 
         // Should be able to reset expiry back and make stat valid when calling setattr
         let atime = OffsetDateTime::UNIX_EPOCH + Duration::days(90);
@@ -862,7 +846,7 @@ mod tests {
         let stat = lookup.stat;
         assert_eq!(stat.atime, atime);
         assert_eq!(stat.mtime, mtime);
-        assert!(!stat.expiry.is_expired());
+        assert!(stat.expiry >= Instant::now());
     }
 
     #[cfg(feature = "shuttle")]

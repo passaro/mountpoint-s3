@@ -1,10 +1,8 @@
-use std::time::Duration;
-
 use nix::unistd::{getgid, getuid};
 
-use crate::mem_limiter::MINIMUM_MEM_LIMIT;
 use crate::s3::S3Personality;
 use crate::superblock::WriteMode;
+use crate::{mem_limiter::MINIMUM_MEM_LIMIT, superblock::ShortDuration};
 
 use super::{ServerSideEncryption, TimeToLive};
 
@@ -84,13 +82,13 @@ pub struct CacheConfig {
     /// immediately `getattr` every entry returned from `readdir`.
     pub serve_lookup_from_cache: bool,
     /// How long the kernel will cache metadata for files
-    pub file_ttl: Duration,
+    pub file_ttl: ShortDuration,
     /// How long the kernel will cache metadata for directories
-    pub dir_ttl: Duration,
+    pub dir_ttl: ShortDuration,
     /// Should the file system cache negative lookups?
     pub use_negative_cache: bool,
     /// How long the file system will cache negative entries
-    pub negative_cache_ttl: Duration,
+    pub negative_cache_ttl: ShortDuration,
     /// Maximum number of negative entries to cache.
     pub negative_cache_size: usize,
 }
@@ -106,8 +104,8 @@ impl Default for CacheConfig {
         // every other cache entry expires by the time that cache miss is serviced. We also apply a
         // longer TTL for directories, which are both less likely to change on the S3 side and
         // checked more often (for directory permissions checks).
-        let file_ttl = Duration::from_millis(100);
-        let dir_ttl = Duration::from_millis(1000);
+        let file_ttl = ShortDuration::from_millis(100);
+        let dir_ttl = ShortDuration::from_millis(1000);
 
         // We want the negative cache to be effective but need to limit its memory usage. This value
         // results in a maximum memory usage of ~20MB (assuming average file name length of 37 bytes)

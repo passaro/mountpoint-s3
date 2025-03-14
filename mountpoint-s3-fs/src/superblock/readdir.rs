@@ -79,7 +79,7 @@ impl ReaddirHandle {
 
             let local_files = dir_state.children.writing.iter().map(|ino| {
                 let inode = inner.get(*ino)?;
-                let stat = inner.stat_for_inode(inode.get_inode_state()?.deref());
+                let stat = inner.stat_for_inode(inode.get_inode_state()?.deref(), inode.expiry());
                 Ok(ReaddirEntry::LocalInode {
                     lookup: LookedUp { inode, stat },
                 })

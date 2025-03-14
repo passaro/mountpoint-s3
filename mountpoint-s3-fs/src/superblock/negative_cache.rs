@@ -1,8 +1,8 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use linked_hash_map::LinkedHashMap;
 
-use super::{expiry::Expiry, InodeNo};
+use super::{expiry::Expiry, InodeNo, ShortDuration, Timeline};
 
 use crate::sync::RwLock;
 
@@ -15,7 +15,8 @@ pub struct NegativeCache {
     /// Upper bound for the cache.
     max_size: usize,
     /// TTL of a key at insertion.
-    ttl: Duration,
+    ttl: ShortDuration,
+    timeline: Timeline,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
@@ -25,11 +26,12 @@ struct Key {
 }
 
 impl NegativeCache {
-    pub fn new(max_size: usize, ttl: Duration) -> Self {
+    pub fn new(max_size: usize, ttl: ShortDuration, timeline: Timeline) -> Self {
         Self {
             map: RwLock::new(Default::default()),
             max_size,
             ttl,
+            timeline,
         }
     }
 
@@ -46,7 +48,7 @@ impl NegativeCache {
             .read()
             .unwrap()
             .get(&key)
-            .is_some_and(|expiry| !expiry.is_expired());
+            .is_some_and(|expiry| self.timeline.is_valid(*expiry));
         metrics::histogram!(
             "metadata_cache.negative_cache.operation_duration_us",
             "op" => "contains",
@@ -79,7 +81,7 @@ impl NegativeCache {
     /// Upon insertion, remove entries that exceed the cache limit or
     /// that have already expired.
     pub fn insert(&self, parent_ino: InodeNo, child_name: &str) {
-        let expiry = Expiry::from_now(self.ttl);
+        let expiry = self.timeline.expiry_from_now(self.ttl);
         let key = Key {
             parent_ino,
             child_name: child_name.to_owned(),
@@ -88,7 +90,7 @@ impl NegativeCache {
         let mut map = self.map.write().unwrap();
         if map.insert(key, expiry).is_none() {
             // Remove entries that have expired.
-            while map.front().is_some_and(|(_, e)| e.is_expired()) {
+            while map.front().is_some_and(|(_, e)| !self.timeline.is_valid(*e)) {
                 _ = map.pop_front();
             }
 
@@ -99,7 +101,7 @@ impl NegativeCache {
                 };
                 // Report how many entries are evicted while still current.
                 metrics::counter!("metadata_cache.negative_cache.entries_evicted_before_expiry")
-                    .increment((!e.is_expired()).into());
+                    .increment((self.timeline.is_valid(e)).into());
             }
             metrics::gauge!("metadata_cache.negative_cache.entries").set(map.len() as f64);
         }
@@ -117,11 +119,13 @@ mod tests {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
+    use crate::superblock::{ShortDuration, Timeline};
+
     use super::NegativeCache;
 
     #[test]
     fn test_contains() {
-        let cache = NegativeCache::new(100, Duration::from_secs(60));
+        let cache = NegativeCache::new(100, ShortDuration::from_secs(60), Timeline::new_from_now());
 
         cache.insert(1, "child1");
         assert!(cache.contains(1, "child1"));
@@ -131,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_insert() {
-        let cache = NegativeCache::new(100, Duration::from_secs(60));
+        let cache = NegativeCache::new(100, ShortDuration::from_secs(60), Timeline::new_from_now());
 
         cache.insert(1, "child1");
         assert!(cache.contains(1, "child1"));
@@ -148,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let cache = NegativeCache::new(100, Duration::from_secs(60));
+        let cache = NegativeCache::new(100, ShortDuration::from_secs(60), Timeline::new_from_now());
 
         cache.insert(1, "child1");
         cache.insert(1, "child2");
@@ -165,7 +169,7 @@ mod tests {
 
     #[test]
     fn test_max_size() {
-        let cache = NegativeCache::new(2, Duration::from_secs(60));
+        let cache = NegativeCache::new(2, ShortDuration::from_secs(60), Timeline::new_from_now());
 
         cache.insert(1, "child1");
         assert!(cache.contains(1, "child1"));
@@ -182,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_expiration() {
-        let cache = NegativeCache::new(100, Duration::from_millis(1));
+        let cache = NegativeCache::new(100, ShortDuration::from_millis(1), Timeline::new_from_now());
 
         cache.insert(1, "child1");
         sleep(Duration::from_millis(2));
@@ -191,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_insert_after_expiry() {
-        let cache = NegativeCache::new(100, Duration::from_millis(50));
+        let cache = NegativeCache::new(100, ShortDuration::from_millis(50), Timeline::new_from_now());
 
         cache.insert(1, "child1");
         sleep(Duration::from_millis(100));
@@ -203,12 +207,13 @@ mod tests {
 
     #[test]
     fn test_insert_resets_ttl() {
-        let ttl = Duration::from_millis(100);
-        let cache = NegativeCache::new(100, ttl);
+        let ttl = ShortDuration::from_millis(100);
+        let cache = NegativeCache::new(100, ttl, Timeline::new_from_now());
 
         cache.insert(1, "child1");
         let inserted_time = Instant::now();
         // Wait for about half ttl, verify the entry has not expirted yet.
+        let ttl: Duration = ttl.into();
         let half_ttl = ttl / 2;
         while Instant::now().saturating_duration_since(inserted_time) <= half_ttl {
             sleep(Duration::from_millis(1));

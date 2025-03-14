@@ -7,15 +7,15 @@
 
 mod common;
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::{fs::OpenOptions, time::Duration};
 
-use crate::common::fuse::{self, TestSessionConfig, TestSessionCreator};
 use mountpoint_s3_fs::data_cache::InMemoryDataCache;
-use mountpoint_s3_fs::fs::{CacheConfig, S3FilesystemConfig};
+use mountpoint_s3_fs::fs::{CacheConfig, S3FilesystemConfig, ShortDuration};
 use serial_test::serial;
 use test_case::test_case;
+
+use crate::common::fuse::{self, TestSessionConfig, TestSessionCreator};
 
 fn cache_and_direct_io_test(creator_fn: impl TestSessionCreator, prefix: &str) {
     const OBJECT_SIZE: usize = 8;
@@ -24,8 +24,8 @@ fn cache_and_direct_io_test(creator_fn: impl TestSessionCreator, prefix: &str) {
         filesystem_config: S3FilesystemConfig {
             cache_config: CacheConfig {
                 serve_lookup_from_cache: true,
-                dir_ttl: Duration::from_secs(600),
-                file_ttl: Duration::from_secs(600),
+                dir_ttl: ShortDuration::from_secs(600),
+                file_ttl: ShortDuration::from_secs(600),
                 ..Default::default()
             },
             ..Default::default()

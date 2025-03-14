@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use fuser::FileType;
 use futures::future::{BoxFuture, FutureExt};
@@ -936,6 +935,7 @@ mod read_only {
 /// the reference model.
 mod mutations {
     use super::*;
+    use mountpoint_s3_fs::fs::ShortDuration;
     use proptest::collection::vec;
 
     fn run_test(initial_tree: TreeNode, ops: Vec<Op>, readdir_limit: usize) {
@@ -948,9 +948,9 @@ mod mutations {
             cache_config: CacheConfig {
                 // We are only interested in strong consistency for the reference tests. FUSE isn't even in the loop.
                 serve_lookup_from_cache: false,
-                dir_ttl: Duration::ZERO,
-                file_ttl: Duration::ZERO,
-                negative_cache_ttl: Duration::ZERO,
+                dir_ttl: ShortDuration::ZERO,
+                file_ttl: ShortDuration::ZERO,
+                negative_cache_ttl: ShortDuration::ZERO,
                 ..Default::default()
             },
             ..Default::default()
