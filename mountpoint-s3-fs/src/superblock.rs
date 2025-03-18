@@ -355,10 +355,8 @@ impl Superblock {
                     WriteStatus::LocalUnopened,
                     0,
                     None,
-                    None,
-                    None,
                 )),
-                InodeKind::Directory => InodeState::Directory(DirState::new(WriteStatus::LocalUnopened)),
+                InodeKind::Directory => InodeState::Directory(DirState::new_local()),
             };
             self.inner
                 .create_inode_locked(&parent_inode, dir_state, name, state, true)?
@@ -398,18 +396,14 @@ impl Superblock {
             unreachable!("Already checked that inode is a directory");
         };
 
-        match dir_state.write_status {
-            WriteStatus::LocalOpen => unreachable!("A directory cannot be in Local open state"),
-            WriteStatus::Remote => {
-                return Err(InodeError::CannotRemoveRemoteDirectory(inode.err()));
-            }
-            WriteStatus::LocalUnopened => {
-                if !dir_state.children.writing.is_empty() {
-                    return Err(InodeError::DirectoryNotEmpty(inode.err()));
-                }
-                dir_state.deleted = true;
-            }
+        if dir_state.remote {
+            return Err(InodeError::CannotRemoveRemoteDirectory(inode.err()));
+        };
+
+        if !dir_state.children.writing.is_empty() {
+            return Err(InodeError::DirectoryNotEmpty(inode.err()));
         }
+        dir_state.deleted = true;
 
         let InodeState::Directory(parent_dir_state) = parent_state.deref_mut() else {
             debug_assert!(false, "inodes never change kind");
@@ -467,7 +461,7 @@ impl Superblock {
                 );
                 return Err(InodeError::UnlinkNotPermittedWhileWriting(inode.err()));
             }
-            WriteStatus::Remote => {
+            WriteStatus::Remote { .. } => {
                 let bucket = self.inner.bucket.as_str();
                 let s3_key = self.full_key_for_inode(&inode);
                 debug!(parent=?parent_ino, ?name, "unlink on remote file will delete key {}", s3_key);
@@ -794,26 +788,33 @@ impl SuperblockInner {
             (Some(remote), Some(existing_inode)) => {
                 let mut existing_state = existing_inode.get_mut_inode_state()?;
                 if existing_state.is_remote() {
-                    let expiry = self.expiry_for_kind(existing_state.kind());
-                    existing_inode.update_validity(expiry);
                     match (remote, existing_state.deref_mut()) {
-                        (RemoteLookup::Prefix, InodeState::Directory(_)) => {
+                        (RemoteLookup::Prefix, InodeState::Directory(DirState { remote, .. })) if *remote => {
                             trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place");
+                            let expiry = self.expiry_for_kind(InodeKind::Directory);
+                            existing_inode.update_validity(expiry);
                             return Ok(Some(LookedUp {
                                 inode: existing_inode.clone(),
                                 stat: self.stat_for_inode(&existing_state, expiry),
                             }));
                         }
-                        (RemoteLookup::Object(lookup), InodeState::File(file_state)) => {
+                        (
+                            RemoteLookup::Object(lookup),
+                            InodeState::File(FileState {
+                                size,
+                                last_modified,
+                                etag,
+                                write_status: WriteStatus::Remote { is_readable, .. },
+                            }),
+                        ) => {
                             trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place");
-                            file_state.update_from_remote(
-                                lookup.last_modified,
-                                lookup.size,
-                                lookup.etag.clone(),
-                                lookup.storage_class.as_deref(),
-                                lookup.restore_status,
-                                self.config.cache_config.file_ttl,
-                            );
+                            *size = lookup.size;
+                            *last_modified = lookup.last_modified;
+                            *etag = Some(lookup.etag.clone());
+                            *is_readable =
+                                WriteStatus::is_readable(lookup.storage_class.as_deref(), lookup.restore_status);
+                            let expiry = self.expiry_for_kind(InodeKind::File);
+                            existing_inode.update_validity(expiry);
                             return Ok(Some(LookedUp {
                                 inode: existing_inode.clone(),
                                 stat: self.stat_for_inode(&existing_state, expiry),
@@ -899,20 +900,25 @@ impl SuperblockInner {
                             trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place");
                             if !existing_is_remote {
                                 trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "local directory has become remote");
-                                dir_state.write_status = WriteStatus::Remote;
+                                dir_state.remote = true;
                                 parent_dir_state.children.writing.remove(&existing_inode.ino());
                             }
                         }
-                        (RemoteLookup::Object(lookup), InodeState::File(file_state)) => {
+                        (
+                            RemoteLookup::Object(lookup),
+                            InodeState::File(FileState {
+                                size,
+                                last_modified,
+                                etag,
+                                write_status: WriteStatus::Remote { is_readable, .. },
+                            }),
+                        ) => {
                             trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place");
-                            file_state.update_from_remote(
-                                lookup.last_modified,
-                                lookup.size,
-                                lookup.etag,
-                                lookup.storage_class.as_deref(),
-                                lookup.restore_status,
-                                self.config.cache_config.file_ttl,
-                            );
+                            *size = lookup.size;
+                            *last_modified = lookup.last_modified;
+                            *etag = Some(lookup.etag);
+                            *is_readable =
+                                WriteStatus::is_readable(lookup.storage_class.as_deref(), lookup.restore_status);
                         }
                         _ => unreachable!("we already checked for same kind"),
                     }
@@ -997,7 +1003,7 @@ impl SuperblockInner {
                 ctime: file_state.last_modified,
                 mtime: file_state.last_modified,
                 etag: file_state.etag.clone(),
-                is_readable: file_state.is_readable,
+                is_readable: file_state.is_readable(),
             },
             InodeState::Directory(_) => InodeStat {
                 expiry,
@@ -1013,7 +1019,7 @@ impl SuperblockInner {
 
     fn inode_state_from_remote(&self, remote: RemoteLookup) -> InodeState {
         match remote {
-            RemoteLookup::Prefix => InodeState::Directory(DirState::new(WriteStatus::Remote)),
+            RemoteLookup::Prefix => InodeState::Directory(DirState::new_remote()),
             RemoteLookup::Object(lookup) => InodeState::File(self.file_state_from_remote(lookup)),
         }
     }
@@ -1021,11 +1027,9 @@ impl SuperblockInner {
     fn file_state_from_remote(&self, lookup: ObjectLookup) -> FileState {
         FileState::new(
             lookup.last_modified,
-            WriteStatus::Remote,
+            WriteStatus::remote(lookup.storage_class.as_deref(), lookup.restore_status),
             lookup.size,
             Some(lookup.etag),
-            lookup.storage_class.as_deref(),
-            lookup.restore_status,
         )
     }
 }

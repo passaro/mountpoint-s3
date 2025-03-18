@@ -174,7 +174,7 @@ impl Inode {
             prefix,
             // The root inode never expires because there's no remote to consult for its
             // metadata, and it always exists.
-            InodeState::Directory(DirState::new(WriteStatus::Remote)),
+            InodeState::Directory(DirState::new(true)),
             Expiry::NEVER,
             1,
         )
@@ -251,19 +251,13 @@ pub(super) struct FileState {
     pub last_modified: OffsetDateTime,
     /// Etag for the file (object)
     pub etag: Option<String>,
-    /// Inodes corresponding to S3 objects with GLACIER or DEEP_ARCHIVE storage classes
-    /// are only readable after restoration. For objects with other storage classes
-    /// this field should be always `true`.
-    pub is_readable: bool,
 
     pub write_status: WriteStatus,
-    /// Number of active prefetching streams on the [Inode].
-    reader_count: u64,
 }
 
 #[derive(Debug)]
 pub(super) struct DirState {
-    pub write_status: WriteStatus,
+    pub remote: bool,
 
     pub children: Box<Children>,
 
@@ -294,8 +288,8 @@ impl InodeState {
 
     pub fn is_remote(&self) -> bool {
         match self {
-            InodeState::File(file_state) => file_state.write_status == WriteStatus::Remote,
-            InodeState::Directory(dir_state) => dir_state.write_status == WriteStatus::Remote,
+            InodeState::File(file_state) => matches!(file_state.write_status, WriteStatus::Remote { .. }),
+            InodeState::Directory(dir_state) => dir_state.remote,
         }
     }
 
@@ -308,9 +302,17 @@ impl InodeState {
 }
 
 impl DirState {
-    pub fn new(write_status: WriteStatus) -> Self {
+    pub fn new_remote() -> Self {
+        Self::new(true)
+    }
+
+    pub fn new_local() -> Self {
+        Self::new(false)
+    }
+
+    fn new(remote: bool) -> Self {
         Self {
-            write_status,
+            remote,
             children: Default::default(),
             deleted: false,
         }
@@ -318,63 +320,20 @@ impl DirState {
 }
 
 impl FileState {
-    pub fn new(
-        last_modified: OffsetDateTime,
-        write_status: WriteStatus,
-        size: usize,
-        etag: Option<String>,
-        storage_class: Option<&str>,
-        restore_status: Option<RestoreStatus>,
-    ) -> Self {
-        let is_readable = Self::is_readable(storage_class, restore_status);
+    pub fn new(last_modified: OffsetDateTime, write_status: WriteStatus, size: usize, etag: Option<String>) -> Self {
         Self {
             write_status,
             size,
             etag,
             last_modified,
-            is_readable,
-            reader_count: 0,
         }
     }
 
-    /// Objects in flexible retrieval storage classes can't be accessed via GetObject unless they are
-    /// restored, and so we override their permissions to 000 and reject reads to them. We also warn
-    /// the first time we see an object like this, because FUSE enforces the 000 permissions on our
-    /// behalf so we might not see an attempted `open` call.
-    fn is_readable(storage_class: Option<&str>, restore_status: Option<RestoreStatus>) -> bool {
-        static HAS_SENT_WARNING: AtomicBool = AtomicBool::new(false);
-        match storage_class {
-            Some("GLACIER") | Some("DEEP_ARCHIVE") => {
-                let restored =
-                    matches!(restore_status, Some(RestoreStatus::Restored { expiry }) if expiry > SystemTime::now());
-                if !restored && !HAS_SENT_WARNING.swap(true, Ordering::SeqCst) {
-                    tracing::warn!(
-                        "objects in the GLACIER and DEEP_ARCHIVE storage classes are only accessible if restored"
-                    );
-                }
-                restored
-            }
-            _ => true,
-        }
-    }
-
-    pub fn update_from_remote(
-        &mut self,
-        last_modified: OffsetDateTime,
-        size: usize,
-        etag: String,
-        storage_class: Option<&str>,
-        restore_status: Option<RestoreStatus>,
-        validity: Duration,
-    ) {
-        self.expiry = Expiry::from_now(validity);
-        self.write_status = WriteStatus::Remote;
-        self.size = size;
-        self.etag = Some(etag);
-        self.atime = last_modified;
-        self.ctime = last_modified;
-        self.mtime = last_modified;
-        self.is_readable = Self::is_readable(storage_class, restore_status);
+    pub fn is_readable(&self) -> bool {
+        let WriteStatus::Remote { is_readable, .. } = self.write_status else {
+            return true;
+        };
+        is_readable
     }
 }
 
@@ -432,7 +391,46 @@ pub enum WriteStatus {
     /// Local inode already opened
     LocalOpen,
     /// Remote inode
-    Remote,
+    Remote {
+        /// Inodes corresponding to S3 objects with GLACIER or DEEP_ARCHIVE storage classes
+        /// are only readable after restoration. For objects with other storage classes
+        /// this field should be always `true`.
+        is_readable: bool,
+
+        /// Number of active prefetching streams on the [Inode].
+        reader_count: u32,
+    },
+}
+
+impl WriteStatus {
+    pub fn remote(storage_class: Option<&str>, restore_status: Option<RestoreStatus>) -> Self {
+        let is_readable = Self::is_readable(storage_class, restore_status);
+        Self::Remote {
+            is_readable,
+            reader_count: 0,
+        }
+    }
+
+    /// Objects in flexible retrieval storage classes can't be accessed via GetObject unless they are
+    /// restored, and so we override their permissions to 000 and reject reads to them. We also warn
+    /// the first time we see an object like this, because FUSE enforces the 000 permissions on our
+    /// behalf so we might not see an attempted `open` call.
+    pub fn is_readable(storage_class: Option<&str>, restore_status: Option<RestoreStatus>) -> bool {
+        static HAS_SENT_WARNING: AtomicBool = AtomicBool::new(false);
+        match storage_class {
+            Some("GLACIER") | Some("DEEP_ARCHIVE") => {
+                let restored =
+                    matches!(restore_status, Some(RestoreStatus::Restored { expiry }) if expiry > SystemTime::now());
+                if !restored && !HAS_SENT_WARNING.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        "objects in the GLACIER and DEEP_ARCHIVE storage classes are only accessible if restored"
+                    );
+                }
+                restored
+            }
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -477,16 +475,17 @@ impl WriteHandle {
         let InodeState::File(file_state) = state.deref_mut() else {
             return Err(InodeError::IsDirectory(inode.err()));
         };
-        if file_state.reader_count > 0 {
-            return Err(InodeError::InodeNotWritableWhileReading(inode.err()));
-        }
         match file_state.write_status {
             WriteStatus::LocalUnopened => {
                 file_state.write_status = WriteStatus::LocalOpen;
                 file_state.size = 0;
             }
             WriteStatus::LocalOpen => return Err(InodeError::InodeAlreadyWriting(inode.err())),
-            WriteStatus::Remote => {
+            WriteStatus::Remote { reader_count, .. } => {
+                if reader_count > 0 {
+                    return Err(InodeError::InodeNotWritableWhileReading(inode.err()));
+                }
+
                 if !mode.is_inode_writable(is_truncate) {
                     return Err(InodeError::InodeNotWritable(inode.err()));
                 }
@@ -543,7 +542,7 @@ impl WriteHandle {
         };
         match file_state.write_status {
             WriteStatus::LocalOpen => {
-                file_state.write_status = WriteStatus::Remote;
+                file_state.write_status = WriteStatus::remote(None, None);
                 file_state.etag = etag.map(|e| e.into_inner());
 
                 // Invalidate the inode's stats so we refresh them from S3 when next queried
@@ -558,7 +557,7 @@ impl WriteHandle {
                         unreachable!("we know the ancestor is a directory");
                     };
                     dir_state.children.writing.remove(&child_ino);
-                    dir_state.write_status = WriteStatus::Remote;
+                    dir_state.remote = true;
                 }
 
                 Ok(())
@@ -581,10 +580,10 @@ impl ReadHandle {
         let InodeState::File(file_state) = state.deref_mut() else {
             return Err(InodeError::IsDirectory(inode.err()));
         };
-        if file_state.write_status != WriteStatus::Remote {
+        let WriteStatus::Remote { reader_count, .. } = &mut file_state.write_status else {
             return Err(InodeError::InodeNotReadableWhileWriting(inode.err()));
-        }
-        file_state.reader_count += 1;
+        };
+        *reader_count += 1;
         drop(state);
         Ok(Self { inode })
     }
@@ -593,10 +592,14 @@ impl ReadHandle {
     pub fn finish(self) -> Result<(), InodeError> {
         // Decrease reader count for the inode
         let mut state = self.inode.get_mut_inode_state()?;
-        let InodeState::File(file_state) = state.deref_mut() else {
-            unreachable!("we know this is a file");
+        let InodeState::File(FileState {
+            write_status: WriteStatus::Remote { reader_count, .. },
+            ..
+        }) = state.deref_mut()
+        else {
+            unreachable!("we know this is a remote file");
         };
-        file_state.reader_count -= 1;
+        *reader_count -= 1;
         Ok(())
     }
 }
@@ -626,10 +629,8 @@ mod tests {
             &superblock.inner.prefix,
             InodeState::File(FileState::new(
                 OffsetDateTime::now_utc(),
-                WriteStatus::Remote,
+                WriteStatus::remote(None, None),
                 0,
-                None,
-                None,
                 None,
             )),
             Expiry::EXPIRED,
@@ -756,11 +757,9 @@ mod tests {
                 checksum: bad_checksum,
                 sync: RwLock::new(InodeState::File(FileState::new(
                     OffsetDateTime::now_utc(),
-                    WriteStatus::Remote,
+                    WriteStatus::remote(None, None),
                     0,
                     Some(ETag::for_tests().as_str().to_owned()),
-                    None,
-                    None,
                 ))),
                 lookup_count: AtomicU64::new(1),
                 expiry: AtomicExpiry::new(Expiry::NEVER),
@@ -815,8 +814,6 @@ mod tests {
                     OffsetDateTime::UNIX_EPOCH,
                     WriteStatus::LocalOpen,
                     0,
-                    None,
-                    None,
                     None,
                 ))),
                 lookup_count: AtomicU64::new(5),
