@@ -233,7 +233,7 @@ impl Superblock {
         &self,
         _client: &OC,
         ino: InodeNo,
-        atime: Option<OffsetDateTime>,
+        _atime: Option<OffsetDateTime>,
         mtime: Option<OffsetDateTime>,
     ) -> Result<LookedUp, InodeError> {
         let inode = self.inner.get(ino)?;
@@ -245,11 +245,8 @@ impl Superblock {
         }
 
         if let InodeState::File(file_state) = sync.deref_mut() {
-            if let Some(t) = atime {
-                file_state.atime = t;
-            }
             if let Some(t) = mtime {
-                file_state.mtime = t;
+                file_state.last_modified = t;
             };
         }
 
@@ -996,9 +993,9 @@ impl SuperblockInner {
             InodeState::File(file_state) => InodeStat {
                 expiry,
                 size: file_state.size,
-                atime: file_state.atime,
-                ctime: file_state.ctime,
-                mtime: file_state.mtime,
+                atime: file_state.last_modified,
+                ctime: file_state.last_modified,
+                mtime: file_state.last_modified,
                 etag: file_state.etag.clone(),
                 is_readable: file_state.is_readable,
             },

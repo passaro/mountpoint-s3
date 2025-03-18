@@ -247,12 +247,8 @@ pub(super) struct FileState {
     /// Size in bytes
     pub size: usize,
 
-    /// Time of last file content modification
-    pub mtime: OffsetDateTime,
-    /// Time of last file metadata (or content) change
-    pub ctime: OffsetDateTime,
-    /// Time of last access
-    pub atime: OffsetDateTime,
+    /// Time of last modification
+    pub last_modified: OffsetDateTime,
     /// Etag for the file (object)
     pub etag: Option<String>,
     /// Inodes corresponding to S3 objects with GLACIER or DEEP_ARCHIVE storage classes
@@ -335,9 +331,7 @@ impl FileState {
             write_status,
             size,
             etag,
-            atime: last_modified,
-            ctime: last_modified,
-            mtime: last_modified,
+            last_modified,
             is_readable,
             reader_count: 0,
         }
