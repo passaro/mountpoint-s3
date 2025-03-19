@@ -810,7 +810,7 @@ impl SuperblockInner {
                             trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place");
                             *size = lookup.size;
                             *last_modified = lookup.last_modified;
-                            *etag = Some(lookup.etag.clone());
+                            *etag = Some(lookup.etag.clone().into());
                             *is_readable =
                                 WriteStatus::is_readable(lookup.storage_class.as_deref(), lookup.restore_status);
                             let expiry = self.expiry_for_kind(InodeKind::File);
@@ -916,7 +916,7 @@ impl SuperblockInner {
                             trace!(parent=?existing_inode.parent(), name=?existing_inode.name(), ino=?existing_inode.ino(), "updating inode in place");
                             *size = lookup.size;
                             *last_modified = lookup.last_modified;
-                            *etag = Some(lookup.etag);
+                            *etag = Some(lookup.etag.into());
                             *is_readable =
                                 WriteStatus::is_readable(lookup.storage_class.as_deref(), lookup.restore_status);
                         }
@@ -974,7 +974,10 @@ impl SuperblockInner {
         let inode = Inode::new(next_ino, parent.ino(), key, &self.prefix, state, expiry, 0);
         trace!(parent=?inode.parent(), name=?inode.name(), kind=?inode.kind(), new_ino=?inode.ino(), key=?inode.key(), "created new inode");
 
-        let existing_inode = parent_locked.children.names.insert(name.to_string(), inode.clone());
+        let existing_inode = parent_locked
+            .children
+            .names
+            .insert(name.to_string().into(), inode.clone());
         if is_new_file {
             parent_locked.children.writing.insert(next_ino);
         }
@@ -1002,7 +1005,7 @@ impl SuperblockInner {
                 atime: file_state.last_modified,
                 ctime: file_state.last_modified,
                 mtime: file_state.last_modified,
-                etag: file_state.etag.clone(),
+                etag: file_state.etag.clone().map(|e| e.into_string()),
                 is_readable: file_state.is_readable(),
             },
             InodeState::Directory(_) => InodeStat {
@@ -1029,7 +1032,7 @@ impl SuperblockInner {
             lookup.last_modified,
             WriteStatus::remote(lookup.storage_class.as_deref(), lookup.restore_status),
             lookup.size,
-            Some(lookup.etag),
+            Some(lookup.etag.into()),
         )
     }
 }

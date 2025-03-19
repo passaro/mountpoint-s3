@@ -250,7 +250,7 @@ pub(super) struct FileState {
     /// Time of last modification
     pub last_modified: OffsetDateTime,
     /// Etag for the file (object)
-    pub etag: Option<String>,
+    pub etag: Option<Box<str>>,
 
     pub write_status: WriteStatus,
 }
@@ -271,7 +271,7 @@ pub(super) struct Children {
     ///
     /// The existence of a child or lack thereof does not imply the object does not exist,
     /// nor that it currently exists in S3 in that state.
-    pub names: HashMap<String, Inode>,
+    pub names: HashMap<Box<str>, Inode>,
 
     /// A set of inode numbers that have been opened for write but not completed yet.
     /// This should be a subset of the [children](Self::Directory::children) field.
@@ -320,7 +320,7 @@ impl DirState {
 }
 
 impl FileState {
-    pub fn new(last_modified: OffsetDateTime, write_status: WriteStatus, size: usize, etag: Option<String>) -> Self {
+    pub fn new(last_modified: OffsetDateTime, write_status: WriteStatus, size: usize, etag: Option<Box<str>>) -> Self {
         Self {
             write_status,
             size,
@@ -543,7 +543,7 @@ impl WriteHandle {
         match file_state.write_status {
             WriteStatus::LocalOpen => {
                 file_state.write_status = WriteStatus::remote(None, None);
-                file_state.etag = etag.map(|e| e.into_inner());
+                file_state.etag = etag.map(|e| e.into_inner().into());
 
                 // Invalidate the inode's stats so we refresh them from S3 when next queried
                 self.inode.update_validity(Expiry::EXPIRED);
@@ -759,7 +759,7 @@ mod tests {
                     OffsetDateTime::now_utc(),
                     WriteStatus::remote(None, None),
                     0,
-                    Some(ETag::for_tests().as_str().to_owned()),
+                    Some(ETag::for_tests().as_str().into()),
                 ))),
                 lookup_count: AtomicU64::new(1),
                 expiry: AtomicExpiry::new(Expiry::NEVER),
