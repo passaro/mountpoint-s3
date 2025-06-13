@@ -1668,3 +1668,48 @@ fn append_fails_on_object_replaced_s3() {
 fn append_fails_on_object_replaced_mock() {
     append_fails_on_object_replaced(fuse::mock_session::new);
 }
+
+#[test]
+fn large_sequential_write_streaming_test() {
+    let test_session = fuse::s3_session::new("large_sequential_write_streaming_test", Default::default());
+
+    let object_size: usize = 32 * 1024 * 1024 * 1024;
+    let chunk_data = {
+        let write_chunk_size = 256 * 1024;
+        let mut rng = ChaCha20Rng::seed_from_u64(0x12345678 + write_chunk_size as u64);
+        let mut data = vec![0u8; write_chunk_size];
+        rng.fill(&mut data[..]);
+        data
+    };
+
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let file_name = format!("upload_{i}");
+        let path = test_session.mount_path().join(&file_name);
+        let chunk_data = chunk_data.clone();
+        let handle = thread::spawn(move || {
+            let mut f = File::options().append(true).create(true).open(&path).unwrap();
+
+            let num_chunks= object_size.div_ceil(chunk_data.len());
+            tracing::info!(file_name, "Expected chunks: {} / {} = {}", object_size, chunk_data.len(), num_chunks);
+
+            for chunk in 0..num_chunks {
+                if chunk % 10000 == 0 {
+                    tracing::info!(file_name, chunk, "Writing chunk");
+                }
+                let bytes = chunk_data.len().min(object_size - chunk * chunk_data.len());
+                f.write_all(&chunk_data[..bytes]).unwrap();
+            }
+            f.sync_all().unwrap();
+            drop(f);
+
+            let m = metadata(&path).unwrap();
+            assert_eq!(m.len() as usize, object_size);
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
