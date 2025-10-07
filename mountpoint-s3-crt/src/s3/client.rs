@@ -16,7 +16,7 @@ use mountpoint_s3_crt_sys::*;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Display};
 use std::marker::PhantomPinned;
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::os::unix::prelude::OsStrExt;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -284,6 +284,8 @@ struct MetaRequestOptionsInner<'a> {
     /// Finish callback, if provided (and not already called, since it's FnOnce).
     on_finish: Option<FinishCallback>,
 
+    tag: u64,
+
     /// Pin this struct because inner.user_data will be a pointer to this object.
     _pinned: PhantomPinned,
 }
@@ -356,6 +358,7 @@ impl<'a> MetaRequestOptions<'a> {
             on_body_ex: None,
             on_upload_review: None,
             on_finish: None,
+            tag: 0,
             _pinned: Default::default(),
         });
 
@@ -502,6 +505,14 @@ impl<'a> MetaRequestOptions<'a> {
         // SAFETY: We ensure that the cursor points to data that lives
         // as long as the options struct
         options.inner.copy_source_uri = unsafe { options.copy_source_uri.as_mut().unwrap().as_aws_byte_cursor() };
+        self
+    }
+
+    /// Set a tag for this request.
+    pub fn request_tag(&mut self, tag: u64) -> &mut Self {
+        // SAFETY: we aren't moving out of the struct.
+        let options = unsafe { Pin::get_unchecked_mut(Pin::as_mut(&mut self.0)) };
+        options.tag = tag;
         self
     }
 }
@@ -677,6 +688,21 @@ pub struct MetaRequest {
 }
 
 impl MetaRequest {
+    pub(crate) fn borrow(inner: NonNull<aws_s3_meta_request>) -> ManuallyDrop<Self> {
+        ManuallyDrop::new(Self { inner })
+    }
+
+    pub(crate) fn meta_request_type(&self) -> MetaRequestType {
+        // SAFETY: `self.inner` is a pointer to a valid `aws_s3_meta_request`.
+        let request_type = unsafe { self.inner.as_ref().type_ };
+        request_type.into()
+    }
+
+    pub(crate) fn meta_request_tag(&self) -> u64 {
+        // SAFETY: `self.inner` is a pointer to a valid `aws_s3_meta_request`.
+        unsafe { MetaRequestOptionsInner::from_user_data_ptr(self.inner.as_ref().user_data).tag }
+    }
+
     /// Cancel the meta request. Does nothing (but does not fail/panic) if the request has already
     /// completed. If the request has not already completed, parts may still be delivered to the
     /// `body_callback` after this method completes, and the `finish_callback` will still be

@@ -234,6 +234,7 @@ pub struct GetObjectParams {
     pub range: Option<Range<u64>>,
     pub if_match: Option<ETag>,
     pub checksum_mode: Option<ChecksumMode>,
+    pub tag: Option<u64>,
 }
 
 impl GetObjectParams {
@@ -257,6 +258,12 @@ impl GetObjectParams {
     /// Set option to retrieve checksum as part of the GetObject request
     pub fn checksum_mode(mut self, value: Option<ChecksumMode>) -> Self {
         self.checksum_mode = value;
+        self
+    }
+
+    /// Set optional tag
+    pub fn tag(mut self, value: Option<u64>) -> Self {
+        self.tag = value;
         self
     }
 }
