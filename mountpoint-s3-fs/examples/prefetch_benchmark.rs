@@ -8,15 +8,16 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use clap::{Parser, value_parser};
 use futures::executor::block_on;
+use futures::{Stream, StreamExt as _, pin_mut};
 use mountpoint_s3_client::config::{EndpointConfig, RustLogAdapter, S3ClientConfig};
-use mountpoint_s3_client::types::HeadObjectParams;
+use mountpoint_s3_client::types::{GetBodyPart, HeadObjectParams};
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
 use mountpoint_s3_fs::Runtime;
 use mountpoint_s3_fs::mem_limiter::MemoryLimiter;
 use mountpoint_s3_fs::memory::PagedPool;
 use mountpoint_s3_fs::object::ObjectId;
-use mountpoint_s3_fs::prefetch::{PrefetchGetObject, Prefetcher, PrefetcherConfig};
 use mountpoint_s3_fs::s3::config::INITIAL_READ_WINDOW_SIZE;
+use mountpoint_s3_fs::scheduler::Scheduler;
 use serde_json::{json, to_writer};
 use sysinfo::{RefreshKind, System};
 use tracing_subscriber::EnvFilter;
@@ -137,8 +138,8 @@ impl CliArgs {
     fn s3_client_config(&self) -> S3ClientConfig {
         // Set up backpressure with the same initial window used in Mountpoint.
         let mut client_config = S3ClientConfig::new()
-            .read_backpressure(true)
-            .initial_read_window(INITIAL_READ_WINDOW_SIZE)
+            .read_backpressure(false)
+            //.initial_read_window(INITIAL_READ_WINDOW_SIZE)
             .endpoint_config(EndpointConfig::new(self.region.as_str()));
         if let Some(throughput_target_gbps) = self.maximum_throughput_gbps {
             client_config = client_config.throughput_target_gbps(throughput_target_gbps as f64);
@@ -173,7 +174,7 @@ fn main() -> anyhow::Result<()> {
     let pool = PagedPool::new_with_candidate_sizes([args.part_size.unwrap_or(8 * 1024 * 1024) as usize]);
     let client_config = args.s3_client_config().memory_pool(pool.clone());
     let client = S3CrtClient::new(client_config).context("failed to create S3 CRT client")?;
-    let mem_limiter = Arc::new(MemoryLimiter::new(pool, args.memory_target_in_bytes()));
+    let _mem_limiter = Arc::new(MemoryLimiter::new(pool, args.memory_target_in_bytes()));
     let runtime = Runtime::new(client.event_loop_group());
 
     // Verify if all objects exist and collect metadata
@@ -196,11 +197,7 @@ fn main() -> anyhow::Result<()> {
     while iteration < args.iterations && Instant::now() < timeout {
         let received_bytes = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
-        let manager = Prefetcher::default_builder(client.clone()).build(
-            runtime.clone(),
-            mem_limiter.clone(),
-            PrefetcherConfig::default(),
-        );
+        let manager = Scheduler::new(client.clone(), runtime.clone());
 
         thread::scope(|scope| {
             let mut download_tasks = Vec::new();
@@ -208,7 +205,7 @@ fn main() -> anyhow::Result<()> {
             for (object_id, size) in &object_metadata {
                 let received_bytes = received_bytes.clone();
                 let object_id = object_id.clone();
-                let request = manager.prefetch(bucket.to_string(), object_id.clone(), *size);
+                let request = manager.download(bucket.to_string(), object_id.clone(), *size);
                 let read_size = args.read_size;
 
                 let task = scope.spawn(move || {
@@ -273,17 +270,20 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn wait_for_download(
-    mut request: PrefetchGetObject<S3CrtClient>,
-    size: u64,
-    read_size: u64,
+    request: impl Stream<Item = Result<GetBodyPart, impl Error + 'static>>,
+    _size: u64,
+    _read_size: u64,
     timeout: Instant,
 ) -> Result<u64, Box<dyn Error>> {
-    let mut offset = 0;
+    pin_mut!(request);
+
     let mut total_bytes_read = 0;
-    while offset < size && Instant::now() < timeout {
-        let bytes = request.read(offset, read_size as usize).await?;
+    while let Some(part) = request.next().await
+        && Instant::now() < timeout
+    {
+        let part = part?;
+        let bytes = part.data;
         let bytes_read = bytes.len() as u64;
-        offset += bytes_read;
         total_bytes_read += bytes_read;
     }
     Ok(total_bytes_read)

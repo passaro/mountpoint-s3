@@ -2714,6 +2714,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "pin-project",
  "predicates",
  "procfs",
  "proptest",

@@ -41,3 +41,5 @@ fn init_crt() {
     mountpoint_s3_client::config::io_library_init(&mountpoint_s3_client::config::Allocator::default());
     mountpoint_s3_client::config::s3_library_init(&mountpoint_s3_client::config::Allocator::default());
 }
+
+pub mod scheduler;
