@@ -38,7 +38,7 @@ pub struct RequestTaskConfig {
     pub range: RequestRange,
     pub read_part_size: usize,
     pub preferred_part_size: usize,
-    pub initial_read_window_size: usize,
+    pub initial_read_request_size: usize,
     pub max_read_window_size: usize,
     pub read_window_size_multiplier: usize,
 }
@@ -217,7 +217,7 @@ impl<Client: ObjectClient + Clone + Send + Sync + 'static> ObjectPartStream<Clie
         let range = config.range;
 
         let backpressure_config = BackpressureConfig {
-            initial_read_window_size: config.initial_read_window_size,
+            initial_read_window_size: config.initial_read_request_size,
             // We don't want to completely block the stream so let's use
             // the read part size as minimum read window.
             min_read_window_size: config.read_part_size,
@@ -236,13 +236,13 @@ impl<Client: ObjectClient + Clone + Send + Sync + 'static> ObjectPartStream<Clie
             .runtime
             .spawn_with_handle(
                 async move {
-                    let first_read_window_end_offset = config.range.start() + config.initial_read_window_size as u64;
+                    let first_read_request_end_offset = config.range.start() + config.initial_read_request_size as u64;
                     let request_stream = read_from_client_stream(
                         &mut backpressure_limiter,
                         &client,
                         config.bucket,
                         config.object_id.clone(),
-                        first_read_window_end_offset,
+                        first_read_request_end_offset,
                         config.range,
                     );
 
@@ -311,7 +311,7 @@ where
 }
 
 /// Creates a request stream with a given range. The stream will be served from two `GetObject` requests where the first request serves
-/// data up to `first_read_window_end_offset` and the second request serves the rest of the stream.
+/// data up to `first_read_request_end_offset` and the second request serves the rest of the stream.
 /// A [PrefetchReadError] is returned when the request cannot be completed.
 ///
 /// This is a workaround for a specific issue where initial read window size could be very small (~1MB), but the CRT only returns data
@@ -322,12 +322,12 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
     client: &'a Client,
     bucket: String,
     object_id: ObjectId,
-    first_read_window_end_offset: u64,
+    first_read_request_end_offset: u64,
     range: RequestRange,
 ) -> impl Stream<Item = RequestReaderOutput<Client::ClientError>> + 'a {
     try_stream! {
         // Let's start by issuing the first request with a range trimmed to initial read window offset
-        let first_req_range = range.trim_end(first_read_window_end_offset);
+        let first_req_range = range.trim_end(first_read_request_end_offset);
         let mut current_offset = first_req_range.start();
         if !first_req_range.is_empty() {
             let first_request_stream = read_from_request(
@@ -347,7 +347,7 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
 
         // After the first request is completed we will create the second request for the rest of the stream,
         // but only if there is something left to be fetched.
-        let range = range.trim_start(first_read_window_end_offset);
+        let range = range.trim_start(first_read_request_end_offset);
         if !range.is_empty() {
             if current_offset < range.start() {
                 // We got less data than we requested. We assume the consumer will consume

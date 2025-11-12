@@ -16,6 +16,7 @@ use mountpoint_s3_fs::{
     manifest::{ChannelConfig, Manifest, ManifestMetablock, ingest_manifest},
     memory::PagedPool,
     metrics::{self, MetricsSinkHandle},
+    prefetch::PrefetcherConfig,
     s3::config::{ClientConfig, PartConfig, Region, TargetThroughputSetting},
 };
 use nix::sys::signal::{self, Signal};
@@ -74,6 +75,7 @@ struct ConfigOptions {
     auto_unmount: Option<bool>,
     user_agent_prefix: Option<String>,
     part_size: Option<usize>,
+    initial_read_request_size: Option<usize>,
     /// Target memory limit (in bytes) that Mountpoint will try to enforce
     memory_limit_bytes: Option<u64>,
 
@@ -101,8 +103,13 @@ impl ConfigOptions {
     }
 
     fn build_filesystem_config(&self) -> Result<S3FilesystemConfig> {
+        let mut prefetcher_config = PrefetcherConfig::default();
+        if let Some(initial_read_request_size) = self.initial_read_request_size {
+            prefetcher_config.initial_read_request_size = initial_read_request_size;
+        }
         let mut fs_config = S3FilesystemConfig {
             cache_config: CacheConfig::new(mountpoint_s3_fs::fs::TimeToLive::Indefinite),
+            prefetcher_config,
             ..Default::default()
         };
 

@@ -322,6 +322,7 @@ impl ReadWindowIncrementQueue {
 
 #[cfg(test)]
 mod tests {
+    use super::super::INITIAL_READ_WINDOW_SIZE;
     use super::*;
 
     use std::sync::Arc;
@@ -332,7 +333,6 @@ mod tests {
 
     use crate::mem_limiter::MemoryLimiter;
     use crate::memory::PagedPool;
-    use crate::s3::config::INITIAL_READ_WINDOW_SIZE;
 
     #[test_case(INITIAL_READ_WINDOW_SIZE, 2)] // real config
     #[test_case(3 * 1024 * 1024, 4)]

@@ -52,7 +52,7 @@ where
         let range = config.range;
 
         let backpressure_config = BackpressureConfig {
-            initial_read_window_size: config.initial_read_window_size,
+            initial_read_window_size: config.initial_read_request_size,
             min_read_window_size: config.read_part_size,
             max_read_window_size: config.max_read_window_size,
             read_window_size_multiplier: config.read_window_size_multiplier,
@@ -197,7 +197,7 @@ where
     ) {
         let bucket = &self.config.bucket;
         let cache_key = &self.config.object_id;
-        let first_read_window_end_offset = self.config.range.start() + self.config.initial_read_window_size as u64;
+        let first_read_window_end_offset = self.config.range.start() + self.config.initial_read_request_size as u64;
         let block_size = self.cache.block_size();
         assert!(block_size > 0);
 
@@ -439,7 +439,7 @@ mod tests {
         let id = ObjectId::new(key.to_owned(), object.etag());
 
         // backpressure config
-        let initial_read_window_size = 1 * MB;
+        let initial_read_request_size = 1 * MB;
         let max_read_window_size = 64 * MB;
         let read_window_size_multiplier = 2;
 
@@ -451,7 +451,7 @@ mod tests {
                 .bucket(bucket)
                 .part_size(client_part_size)
                 .enable_backpressure(true)
-                .initial_read_window_size(initial_read_window_size)
+                .initial_read_window_size(client_part_size)
                 .build(),
         );
         let pool = PagedPool::new_with_candidate_sizes([block_size, client_part_size]);
@@ -473,7 +473,7 @@ mod tests {
                 range,
                 read_part_size: client_part_size,
                 preferred_part_size: 256 * KB,
-                initial_read_window_size,
+                initial_read_request_size,
                 max_read_window_size,
                 read_window_size_multiplier,
             };
@@ -499,7 +499,7 @@ mod tests {
                 range,
                 read_part_size: client_part_size,
                 preferred_part_size: 256 * KB,
-                initial_read_window_size,
+                initial_read_request_size,
                 max_read_window_size,
                 read_window_size_multiplier,
             };
@@ -522,7 +522,7 @@ mod tests {
         let id = ObjectId::new(key.to_owned(), object.etag());
 
         // backpressure config
-        let initial_read_window_size = 1 * MB;
+        let initial_read_request_size = 1 * MB;
         let max_read_window_size = 64 * MB;
         let read_window_size_multiplier = 2;
 
@@ -534,7 +534,7 @@ mod tests {
                 .bucket(bucket)
                 .part_size(client_part_size)
                 .enable_backpressure(true)
-                .initial_read_window_size(initial_read_window_size)
+                .initial_read_window_size(client_part_size)
                 .build(),
         );
         let pool = PagedPool::new_with_candidate_sizes([block_size, client_part_size]);
@@ -552,7 +552,7 @@ mod tests {
                     range: RequestRange::new(object_size, offset as u64, preferred_size),
                     read_part_size: client_part_size,
                     preferred_part_size: 256 * KB,
-                    initial_read_window_size,
+                    initial_read_request_size,
                     max_read_window_size,
                     read_window_size_multiplier,
                 };

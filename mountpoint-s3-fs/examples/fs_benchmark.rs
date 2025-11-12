@@ -11,7 +11,6 @@ use mountpoint_s3_fs::fuse::config::{FuseOptions, FuseSessionConfig, MountPoint}
 use mountpoint_s3_fs::fuse::session::FuseSession;
 use mountpoint_s3_fs::memory::PagedPool;
 use mountpoint_s3_fs::prefetch::Prefetcher;
-use mountpoint_s3_fs::s3::config::INITIAL_READ_WINDOW_SIZE;
 use mountpoint_s3_fs::s3::{Bucket, S3Path};
 use mountpoint_s3_fs::{Runtime, S3Filesystem, S3FilesystemConfig, Superblock, SuperblockConfig};
 use tempfile::tempdir;
@@ -145,10 +144,7 @@ fn mount_file_system(
 ) -> FuseSession {
     let pool = PagedPool::new_with_candidate_sizes([8 * 1024 * 1024]);
     let mut config = S3ClientConfig::new().endpoint_config(EndpointConfig::new(region));
-    config = config
-        .read_backpressure(true)
-        .initial_read_window(INITIAL_READ_WINDOW_SIZE)
-        .memory_pool(pool.clone());
+    config = config.read_backpressure(true).memory_pool(pool.clone());
     if let Some(throughput_target_gbps) = throughput_target_gbps {
         config = config.throughput_target_gbps(throughput_target_gbps);
     }
