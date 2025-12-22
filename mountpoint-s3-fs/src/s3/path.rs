@@ -19,7 +19,7 @@ pub enum S3PathError {
     PrefixError(#[from] PrefixError),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Bucket(String);
 
 impl Bucket {

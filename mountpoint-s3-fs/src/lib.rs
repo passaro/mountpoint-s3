@@ -4,6 +4,7 @@ mod async_util;
 pub mod autoconfigure;
 pub mod checksums;
 mod config;
+pub mod data;
 pub mod data_cache;
 pub mod fs;
 pub mod fuse;

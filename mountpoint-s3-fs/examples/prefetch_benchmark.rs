@@ -2,7 +2,6 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -12,12 +11,15 @@ use mountpoint_s3_client::config::{EndpointConfig, RustLogAdapter, S3ClientConfi
 use mountpoint_s3_client::types::HeadObjectParams;
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
 use mountpoint_s3_fs::Runtime;
+use mountpoint_s3_fs::data::{DataLayer, Download, create_data_layer};
 use mountpoint_s3_fs::mem_limiter::MemoryLimiter;
 use mountpoint_s3_fs::memory::PagedPool;
 use mountpoint_s3_fs::object::ObjectId;
-use mountpoint_s3_fs::prefetch::{PrefetchGetObject, Prefetcher, PrefetcherConfig};
+use mountpoint_s3_fs::prefetch::{Prefetcher, PrefetcherConfig};
 use serde_json::{json, to_writer};
 use sysinfo::{RefreshKind, System};
+use tokio::runtime;
+use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -169,7 +171,8 @@ fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
 
     let bucket = args.bucket.as_str();
-    let pool = PagedPool::new_with_candidate_sizes([args.part_size.unwrap_or(8 * 1024 * 1024) as usize]);
+    let part_size = args.part_size.unwrap_or(8 * 1024 * 1024) as usize;
+    let pool = PagedPool::new_with_candidate_sizes([part_size]);
     let client_config = args.s3_client_config().memory_pool(pool.clone());
     let client = S3CrtClient::new(client_config).context("failed to create S3 CRT client")?;
     let mem_limiter = Arc::new(MemoryLimiter::new(pool, args.memory_target_in_bytes()));
@@ -186,51 +189,68 @@ fn main() -> anyhow::Result<()> {
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+    let threaded_rt = runtime::Runtime::new()?;
+    threaded_rt.block_on(async move {
+        let manager = create_data_layer(Prefetcher::default_builder(client.clone()).build(
+            runtime.clone(),
+            mem_limiter.clone(),
+            PrefetcherConfig::default(),
+        ));
+
+        run_benchmark(args, object_metadata, manager).await;
+    });
+
+    Ok(())
+}
+
+async fn run_benchmark(
+    args: CliArgs,
+    object_metadata: Vec<(ObjectId, u64)>,
+    manager: impl DataLayer + Send + Sync + 'static,
+) {
+    let bucket = args.bucket.to_string();
+    let max_duration = args.max_duration.unwrap_or(Duration::from_secs(SECONDS_PER_DAY));
+
     let total_start = Instant::now();
     let mut iteration = 0;
     let mut total_bytes = 0;
     let mut iter_results = Vec::new();
-    let max_duration = args.max_duration.unwrap_or(Duration::from_secs(SECONDS_PER_DAY));
     let timeout: Instant = total_start.checked_add(max_duration).expect("Duration overflow error");
+    let manager = Arc::new(manager);
     while iteration < args.iterations && Instant::now() < timeout {
         let received_bytes = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
-        let manager = Prefetcher::default_builder(client.clone()).build(
-            runtime.clone(),
-            mem_limiter.clone(),
-            PrefetcherConfig::default(),
-        );
 
-        thread::scope(|scope| {
-            let mut download_tasks = Vec::new();
+        let mut download_tasks = JoinSet::new();
 
-            for (object_id, size) in &object_metadata {
-                let received_bytes = received_bytes.clone();
-                let object_id = object_id.clone();
-                let request = manager.prefetch(bucket.to_string(), object_id.clone(), *size);
-                let read_size = args.read_size;
+        for (object_id, size) in &object_metadata {
+            let size = *size;
+            let received_bytes = received_bytes.clone();
+            let bucket = bucket.clone();
+            let key = object_id.key().to_string();
+            let etag = object_id.etag().clone();
+            let manager = manager.clone();
+            let read_size = args.read_size;
 
-                let task = scope.spawn(move || {
-                    let result = block_on(wait_for_download(request, *size, read_size as u64, timeout));
-                    if let Ok(bytes_read) = result {
-                        received_bytes.fetch_add(bytes_read, Ordering::SeqCst);
-                    } else {
-                        // As object download failures can produce
-                        // misleading results, exit the benchmarks
-                        // to avoid confusion.
-                        eprintln!("Download failed: {:?}", result.err());
-                        eprintln!("Exiting benchmarks due to download failure");
-                        std::process::exit(1);
-                    }
-                });
+            download_tasks.spawn(async move {
+                println!("Download started");
+                let request = manager.download(bucket, key, etag, size as usize);
+                let result = wait_for_download(request, size, read_size as u64, timeout).await;
+                if let Ok(bytes_read) = result {
+                    println!("Downloaded {bytes_read} bytes");
+                    received_bytes.fetch_add(bytes_read, Ordering::SeqCst);
+                } else {
+                    // As object download failures can produce
+                    // misleading results, exit the benchmarks
+                    // to avoid confusion.
+                    eprintln!("Download failed: {:?}", result.err());
+                    eprintln!("Exiting benchmarks due to download failure");
+                    std::process::exit(1);
+                }
+            });
+        }
 
-                download_tasks.push(task);
-            }
-
-            for task in download_tasks {
-                task.join().unwrap();
-            }
-        });
+        download_tasks.join_all().await;
 
         let elapsed = start.elapsed();
         let received_size = received_bytes.load(Ordering::SeqCst);
@@ -267,12 +287,10 @@ fn main() -> anyhow::Result<()> {
         });
         to_writer(output_file, &results).expect("Failed to write to output file: {output_path}");
     }
-
-    Ok(())
 }
 
 async fn wait_for_download(
-    mut request: PrefetchGetObject<S3CrtClient>,
+    mut request: impl Download,
     size: u64,
     read_size: u64,
     timeout: Instant,
