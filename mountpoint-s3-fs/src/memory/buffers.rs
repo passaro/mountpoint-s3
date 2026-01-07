@@ -87,8 +87,8 @@ impl AsRef<[u8]> for PoolBuffer {
 /// A mutable buffer backed by the pool.
 #[derive(Debug)]
 pub struct PoolBufferMut {
-    buffer: PoolBuffer,
-    len: usize,
+    pub(crate) buffer: PoolBuffer,
+    pub(crate) len: usize,
 }
 
 impl PoolBufferMut {
@@ -137,6 +137,15 @@ impl PoolBufferMut {
 
     pub fn into_bytes(self) -> Bytes {
         Bytes::from_owner(self)
+    }
+
+    pub(crate) fn consume(&mut self, data: &mut impl bytes::Buf) -> usize {
+        use bytes::Buf;
+
+        let count = data.remaining().min(self.capacity() - self.len);
+        data.copy_to_slice(&mut self.buffer[self.len..]);
+        self.len += count;
+        count
     }
 }
 

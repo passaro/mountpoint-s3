@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
 use clap::{Parser, value_parser};
 use futures::channel::mpsc::UnboundedSender;
 use futures::executor::block_on;
@@ -13,7 +15,7 @@ use mountpoint_s3_client::config::{EndpointConfig, RustLogAdapter, S3ClientConfi
 use mountpoint_s3_client::types::HeadObjectParams;
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
 use mountpoint_s3_fs::Runtime;
-use mountpoint_s3_fs::data::{DataLayer, Download, create_data_layer};
+use mountpoint_s3_fs::data::{DataLayer, Download, PrefetchConfig, TMDataLayer, create_data_layer};
 use mountpoint_s3_fs::mem_limiter::MemoryLimiter;
 use mountpoint_s3_fs::memory::PagedPool;
 use mountpoint_s3_fs::object::ObjectId;
@@ -119,6 +121,9 @@ pub struct CliArgs {
 
     #[clap(long, help = "Output file to write the results to", value_name = "OUTPUT_FILE")]
     output_file: Option<PathBuf>,
+
+    #[clap(long, help = "Use the new experimental implementation")]
+    experimental: bool,
 }
 
 fn parse_duration(arg: &str) -> Result<Duration, String> {
@@ -178,7 +183,7 @@ fn main() -> anyhow::Result<()> {
     let pool = PagedPool::new_with_candidate_sizes([part_size]);
     let client_config = args.s3_client_config().memory_pool(pool.clone());
     let client = S3CrtClient::new(client_config).context("failed to create S3 CRT client")?;
-    let mem_limiter = Arc::new(MemoryLimiter::new(pool, args.memory_target_in_bytes()));
+    let mem_limiter = Arc::new(MemoryLimiter::new(pool.clone(), args.memory_target_in_bytes()));
     let runtime = Runtime::new(client.event_loop_group());
 
     // Verify if all objects exist and collect metadata
@@ -197,13 +202,31 @@ fn main() -> anyhow::Result<()> {
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         tokio::spawn(async { poll_memory(Duration::from_millis(500), tx).await });
 
-        let manager = create_data_layer(Prefetcher::default_builder(client.clone()).build(
-            runtime.clone(),
-            mem_limiter.clone(),
-            PrefetcherConfig::default(),
-        ));
+        if args.experimental {
+            let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+            let client = aws_sdk_s3::Client::new(&config);
 
-        run_benchmark(args, object_metadata, manager).await;
+            let mut config_builder = aws_sdk_s3_transfer_manager::Config::builder()
+                .client(client)
+                .part_size(PartSize::Target(part_size as u64));
+            if let Some(gbps) = args.maximum_throughput_gbps {
+                config_builder = config_builder.concurrency(ConcurrencyMode::TargetThroughput(
+                    TargetThroughput::new_gigabits_per_sec(gbps),
+                ));
+            }
+            let tm_client = aws_sdk_s3_transfer_manager::Client::new(config_builder.build());
+            let manager = TMDataLayer::new(tm_client, PrefetchConfig::new(part_size), mem_limiter.clone(), pool);
+
+            run_benchmark(args, object_metadata, manager).await;
+        } else {
+            let manager = create_data_layer(Prefetcher::default_builder(client.clone()).build(
+                runtime.clone(),
+                mem_limiter.clone(),
+                PrefetcherConfig::default(),
+            ));
+
+            run_benchmark(args, object_metadata, manager).await;
+        }
 
         rx.close();
         let peak_mem = rx.fold(0, |acc, m| async move { acc.max(m) }).await;
@@ -221,8 +244,13 @@ async fn run_benchmark(
     let bucket = args.bucket.to_string();
     let max_duration = args.max_duration.unwrap_or(Duration::from_secs(SECONDS_PER_DAY));
 
-    println!("Run benchmark - objects: {}, iterations: {}, max duration: {:.2}s", object_metadata.len(), args.iterations, max_duration.as_secs_f64());
-    
+    println!(
+        "Run benchmark - objects: {}, iterations: {}, max duration: {:.2}s",
+        object_metadata.len(),
+        args.iterations,
+        max_duration.as_secs_f64()
+    );
+
     let total_start = Instant::now();
     let mut iteration = 0;
     let mut total_bytes = 0;
