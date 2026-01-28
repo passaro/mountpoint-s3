@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
-use aws_sdk_s3_transfer_manager::{Client as TMClient, operation::download::DownloadHandle};
-use bytes::{Buf, Bytes};
+use aws_sdk_s3_transfer_manager::{Client as TMClient, io::AggregatedBytes, operation::download::DownloadHandle};
+use bytes::{Buf, Bytes, BytesMut};
 use mountpoint_s3_client::types::ETag;
 use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -10,9 +10,7 @@ use tokio::{
 use tracing::{debug, trace};
 
 use crate::{
-    checksums::ChecksummedBytes,
     mem_limiter::{BufferArea, MemoryLimiter},
-    memory::{BufferKind, PagedPool, PoolBuffer},
     s3::Bucket,
 };
 
@@ -31,16 +29,14 @@ pub struct PrefetchConfig {
 pub struct TMDataLayer {
     client: TMClient,
     limiter: Arc<MemoryLimiter>,
-    pool: PagedPool,
     config: PrefetchConfig,
 }
 
 impl TMDataLayer {
-    pub fn new(client: TMClient, config: PrefetchConfig, limiter: Arc<MemoryLimiter>, pool: PagedPool) -> Self {
+    pub fn new(client: TMClient, config: PrefetchConfig, limiter: Arc<MemoryLimiter>) -> Self {
         Self {
             client,
             limiter,
-            pool,
             config,
         }
     }
@@ -105,7 +101,7 @@ struct TMDownload {
     object_info: Arc<ObjectInfo>,
     tm: TMDataLayer,
     current_offset: u64,
-    current_chunk: Option<ChecksummedBytes>,
+    current_chunk: Option<TMBuffer>,
     requests: VecDeque<Request>,
     prefetch_size: usize,
 }
@@ -122,9 +118,9 @@ impl TMDownload {
         }
     }
 
-    async fn read(&mut self, offset: u64, length: usize) -> Result<ChecksummedBytes, anyhow::Error> {
+    async fn read(&mut self, offset: u64, length: usize) -> Result<Bytes, anyhow::Error> {
         if length == 0 || offset >= self.object_info.size() as u64 {
-            return Ok(ChecksummedBytes::default());
+            return Ok(Bytes::default());
         }
 
         if length + offset as usize > self.object_info.size() {
@@ -135,7 +131,7 @@ impl TMDownload {
 
         trace!(offset, length, object = ?self.object_info, "read request");
 
-        let mut buffer = ChecksummedBytes::default();
+        let mut buffer = BytesMut::new();
         while buffer.len() < length {
             let Some(chunk) = self.next_chunk().await? else {
                 break;
@@ -148,22 +144,23 @@ impl TMDownload {
 
             if buffer.is_empty() && chunk.len() >= length {
                 // Happy case: contiguous data available
-                let mut read_chunk = split_to(chunk, length);
-                std::mem::swap(&mut read_chunk, &mut buffer);
+                let read_chunk = chunk.copy_to_bytes(length);
                 self.current_offset += length as u64;
-                break;
+                self.tm.limiter.release(BufferArea::Prefetch, length as u64);
+                return Ok(read_chunk);
             }
 
             let to_read = (length - buffer.len()).min(chunk.len());
-            let read_chunk = split_to(chunk, to_read);
-            buffer.extend(read_chunk)?;
+            let read_chunk = chunk.copy_to_bytes(to_read);
+            buffer.extend_from_slice(&read_chunk);
             self.current_offset += to_read as u64;
+            self.tm.limiter.release(BufferArea::Prefetch, to_read as u64);
         }
 
-        Ok(buffer)
+        Ok(buffer.freeze())
     }
 
-    async fn next_chunk(&mut self) -> Result<Option<&mut ChecksummedBytes>, anyhow::Error> {
+    async fn next_chunk(&mut self) -> Result<Option<&mut TMBuffer>, anyhow::Error> {
         if self.current_chunk.as_ref().is_none_or(|chunk| chunk.is_empty()) {
             while let Some(request) = self.requests.front_mut() {
                 if let Ok(chunk) = request.receiver.try_recv() {
@@ -191,6 +188,14 @@ impl TMDownload {
                 requests_to_cancel = self.requests.len(),
                 "non-sequential read"
             );
+            let requested = self
+                .requests
+                .back()
+                .map(|r| r.range.end)
+                .unwrap_or(offset)
+                .saturating_sub(offset);
+            self.tm.limiter.release(BufferArea::Prefetch, requested);
+
             self.requests.clear();
             self.current_chunk = None;
             self.prefetch_size = 0;
@@ -215,7 +220,7 @@ impl TMDownload {
                 .initiate()?;
 
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-            let handle = tokio::spawn(handle_download(download, self.tm.clone(), sender));
+            let handle = tokio::spawn(handle_download(download, sender));
             let request = Request {
                 _handle: handle,
                 receiver,
@@ -294,7 +299,7 @@ impl PrefetchConfig {
 }
 
 impl Download for TMDownload {
-    async fn read(&mut self, offset: u64, length: usize) -> Result<ChecksummedBytes, anyhow::Error> {
+    async fn read(&mut self, offset: u64, length: usize) -> Result<Bytes, anyhow::Error> {
         self.read(offset, length).await
     }
 }
@@ -302,7 +307,7 @@ impl Download for TMDownload {
 #[derive(Debug)]
 struct Request {
     _handle: JoinHandle<()>,
-    receiver: UnboundedReceiver<Result<ChecksummedBytes, anyhow::Error>>,
+    receiver: UnboundedReceiver<Result<TMBuffer, anyhow::Error>>,
     range: Range<u64>,
 }
 
@@ -310,36 +315,12 @@ fn format_as_byte_range(range: &Range<u64>) -> String {
     format!("bytes={}-{}", range.start, range.end.saturating_sub(1))
 }
 
-const PREFERRED_READ_SIZE: usize = 128 * 1024;
-
-async fn handle_download(
-    mut download: DownloadHandle,
-    tm: TMDataLayer,
-    sender: UnboundedSender<Result<ChecksummedBytes, anyhow::Error>>,
-) {
+async fn handle_download(mut download: DownloadHandle, sender: UnboundedSender<Result<TMBuffer, anyhow::Error>>) {
     while let Some(chunk) = download.body_mut().next().await {
         match chunk {
-            Ok(mut chunk) => {
-                let mut buffer = tm.pool.get_buffer_mut(chunk.data.remaining(), BufferKind::GetObject);
-                buffer.consume(&mut chunk.data);
-
-                let mut bytes = Bytes::from_owner(MemBuffer {
-                    buffer: buffer.buffer,
-                    len: buffer.len,
-                    limiter: tm.limiter.clone(),
-                });
-
-                // pre-split the body into multiple parts as suggested by preferred part size
-                // in order to avoid validating checksum on large parts at read.
-                let alignment = PREFERRED_READ_SIZE;
-                while !bytes.is_empty() {
-                    let chunk_size = alignment.min(bytes.len());
-                    let chunk = bytes.split_to(chunk_size);
-                    // S3 doesn't provide checksum for us if the request range is not aligned to
-                    // object part boundaries, so we're computing our own checksum here.
-                    let checksum_bytes = ChecksummedBytes::new(chunk);
-                    _ = sender.send(Ok(checksum_bytes));
-                }
+            Ok(chunk) => {
+                let data = TMBuffer::new(chunk.data);
+                _ = sender.send(Ok(data));
             }
             Err(e) => {
                 _ = sender.send(Err(e.into()));
@@ -349,32 +330,25 @@ async fn handle_download(
     }
 }
 
-fn split_to(bytes: &mut ChecksummedBytes, at: usize) -> ChecksummedBytes {
-    if bytes.len() == at {
-        std::mem::take(bytes)
-    } else {
-        let mut other = bytes.split_off(at);
-        std::mem::swap(bytes, &mut other);
-        other
-    }
-}
-
-/// A buffer backed by the pool.
 #[derive(Debug)]
-pub struct MemBuffer {
-    buffer: PoolBuffer,
-    len: usize,
-    limiter: Arc<MemoryLimiter>,
+struct TMBuffer {
+    inner: AggregatedBytes,
 }
 
-impl AsRef<[u8]> for MemBuffer {
-    fn as_ref(&self) -> &[u8] {
-        &self.buffer[..self.len]
+impl TMBuffer {
+    fn new(chunk_data: AggregatedBytes) -> Self {
+        Self { inner: chunk_data }
     }
-}
 
-impl Drop for MemBuffer {
-    fn drop(&mut self) {
-        self.limiter.release(BufferArea::Prefetch, self.len as u64);
+    fn is_empty(&self) -> bool {
+        !self.inner.has_remaining()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.remaining()
+    }
+
+    fn copy_to_bytes(&mut self, length: usize) -> Bytes {
+        self.inner.copy_to_bytes(length)
     }
 }

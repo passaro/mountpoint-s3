@@ -1,6 +1,6 @@
+use bytes::Bytes;
 use mountpoint_s3_client::{ObjectClient, types::ETag};
 
-use crate::checksums::ChecksummedBytes;
 use crate::object::ObjectId;
 use crate::prefetch::{PrefetchGetObject, Prefetcher};
 
@@ -34,7 +34,7 @@ impl<Client> Download for PrefetchGetObject<Client>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
-    async fn read(&mut self, offset: u64, length: usize) -> Result<ChecksummedBytes, anyhow::Error> {
-        Ok(self.read(offset, length).await?)
+    async fn read(&mut self, offset: u64, length: usize) -> Result<Bytes, anyhow::Error> {
+        Ok(self.read(offset, length).await?.into_bytes()?)
     }
 }

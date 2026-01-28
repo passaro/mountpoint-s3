@@ -1,7 +1,6 @@
+use bytes::Bytes;
 use futures::Future;
 use mountpoint_s3_client::types::ETag;
-
-use crate::checksums::ChecksummedBytes;
 
 mod adapter;
 mod tm;
@@ -14,9 +13,5 @@ pub trait DataLayer {
 }
 
 pub trait Download: Send {
-    fn read(
-        &mut self,
-        offset: u64,
-        length: usize,
-    ) -> impl Future<Output = Result<ChecksummedBytes, anyhow::Error>> + Send;
+    fn read(&mut self, offset: u64, length: usize) -> impl Future<Output = Result<Bytes, anyhow::Error>> + Send;
 }

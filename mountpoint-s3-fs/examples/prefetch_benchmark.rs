@@ -215,7 +215,7 @@ fn main() -> anyhow::Result<()> {
                 ));
             }
             let tm_client = aws_sdk_s3_transfer_manager::Client::new(config_builder.build());
-            let manager = TMDataLayer::new(tm_client, PrefetchConfig::new(part_size), mem_limiter.clone(), pool);
+            let manager = TMDataLayer::new(tm_client, PrefetchConfig::new(part_size), mem_limiter.clone());
 
             run_benchmark(args, object_metadata, manager).await;
         } else {
