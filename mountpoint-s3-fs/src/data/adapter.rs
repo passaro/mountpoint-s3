@@ -1,10 +1,9 @@
-use bytes::Bytes;
 use mountpoint_s3_client::{ObjectClient, types::ETag};
 
 use crate::object::ObjectId;
 use crate::prefetch::{PrefetchGetObject, Prefetcher};
 
-use super::{DataLayer, Download};
+use super::{Buffer, DataLayer, Download};
 
 pub fn create_data_layer<Client>(prefetcher: Prefetcher<Client>) -> impl DataLayer
 where
@@ -34,7 +33,7 @@ impl<Client> Download for PrefetchGetObject<Client>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
-    async fn read(&mut self, offset: u64, length: usize) -> Result<Bytes, anyhow::Error> {
-        Ok(self.read(offset, length).await?.into_bytes()?)
+    async fn read(&mut self, offset: u64, length: usize) -> Result<Buffer, anyhow::Error> {
+        Ok(self.read(offset, length).await?.into_bytes()?.into())
     }
 }
