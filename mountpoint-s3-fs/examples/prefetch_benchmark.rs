@@ -29,6 +29,11 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 const SECONDS_PER_DAY: u64 = 86400;
 
 /// Like `tracing_subscriber::fmt::init` but sends logs to stderr

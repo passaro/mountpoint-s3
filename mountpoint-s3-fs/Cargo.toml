@@ -92,6 +92,8 @@ toml = "0.9.8"
 walkdir = "2.5.0"
 wiremock = "0.6.5"
 
+tikv-jemallocator = "0.5.4"
+
 [features]
 # Unreleased and/or experimental features: not enabled in the release binary and may be dropped in future
 block_size = []
