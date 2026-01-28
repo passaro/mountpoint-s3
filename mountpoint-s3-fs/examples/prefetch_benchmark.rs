@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::{Parser, value_parser};
+use futures::channel::mpsc::UnboundedSender;
 use futures::executor::block_on;
+use futures::{SinkExt, StreamExt};
 use mountpoint_s3_client::config::{EndpointConfig, RustLogAdapter, S3ClientConfig};
 use mountpoint_s3_client::types::HeadObjectParams;
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
@@ -17,9 +19,10 @@ use mountpoint_s3_fs::memory::PagedPool;
 use mountpoint_s3_fs::object::ObjectId;
 use mountpoint_s3_fs::prefetch::{Prefetcher, PrefetcherConfig};
 use serde_json::{json, to_writer};
-use sysinfo::{RefreshKind, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tokio::runtime;
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -191,6 +194,9 @@ fn main() -> anyhow::Result<()> {
 
     let threaded_rt = runtime::Runtime::new()?;
     threaded_rt.block_on(async move {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        tokio::spawn(async { poll_memory(Duration::from_millis(500), tx).await });
+
         let manager = create_data_layer(Prefetcher::default_builder(client.clone()).build(
             runtime.clone(),
             mem_limiter.clone(),
@@ -198,6 +204,10 @@ fn main() -> anyhow::Result<()> {
         ));
 
         run_benchmark(args, object_metadata, manager).await;
+
+        rx.close();
+        let peak_mem = rx.fold(0, |acc, m| async move { acc.max(m) }).await;
+        println!("Peak memory {peak_mem} bytes");
     });
 
     Ok(())
@@ -304,4 +314,28 @@ async fn wait_for_download(
         total_bytes_read += bytes_read;
     }
     Ok(total_bytes_read)
+}
+
+async fn poll_memory(interval: Duration, mut sender: UnboundedSender<u64>) {
+    let mut sys = System::new();
+    if let Ok(pid) = sysinfo::get_current_pid() {
+        let mut last_mem = 0;
+        loop {
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                false,
+                ProcessRefreshKind::nothing().with_memory(),
+            );
+            if let Some(process) = sys.process(pid) {
+                // update the metrics only when there is some change, otherwise it will be too spammy.
+                if last_mem != process.memory() {
+                    last_mem = process.memory();
+                    if let Err(_e) = sender.send(last_mem).await {
+                        break;
+                    }
+                }
+            }
+            sleep(interval).await;
+        }
+    }
 }
