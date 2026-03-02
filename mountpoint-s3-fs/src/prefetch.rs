@@ -47,9 +47,9 @@ use crate::metrics::defs::{FUSE_CACHE_HIT, PREFETCH_RESET_STATE};
 use crate::object::ObjectId;
 use crate::sync::Arc;
 
-mod backpressure_controller;
 mod builder;
 mod caching_stream;
+mod controller;
 mod part;
 mod part_queue;
 mod part_stream;
@@ -473,7 +473,7 @@ where
         };
 
         // Not enough data in the read window to serve the forward seek
-        if offset >= task.read_window_end_offset() {
+        if offset >= task.requested_offset() {
             return Ok(false);
         }
 
@@ -549,6 +549,7 @@ where
             self.part_stream.client().read_part_size(),
             self.backward_seek_window.max_size(),
         );
+        trace!(seek_window_reservation, "PrefetchGetObject drop releasing memory");
         self.mem_limiter.release(BufferArea::Prefetch, seek_window_reservation);
         self.record_contiguous_read_metric();
     }
@@ -1062,6 +1063,43 @@ mod tests {
             max_forward_seek_wait_distance: 2810651,
             max_backward_seek_distance: 3531090,
             cache_block_size: 1 * MB,
+        };
+        run_random_read_test(PrefetcherType::Default, object_size, reads, config);
+    }
+
+    #[test]
+    fn test_random_read_regression5() {
+        let object_size = 897578;
+        let reads = vec![(0, 1), (11092, 607045), (188841, 235128), (380391, 381173)];
+        let config = TestConfig {
+            initial_request_size: 463309,
+            max_read_window_size: 255477,
+            sequential_prefetch_multiplier: 1,
+            client_part_size: 96753,
+            max_forward_seek_wait_distance: 404257,
+            max_backward_seek_distance: 438778,
+            cache_block_size: 623452,
+        };
+        run_random_read_test(PrefetcherType::Default, object_size, reads, config);
+    }
+
+    #[test]
+    fn test_random_read_regression6() {
+        let object_size = 1024 * 1024;
+        let reads = vec![
+            (0, 1),
+            (10240, 512 * 1024),
+            (172 * 1024, 256 * 1024),
+            (400 * 1024, 400 * 1024),
+        ];
+        let config = TestConfig {
+            initial_request_size: 400 * 1024,
+            max_read_window_size: 256 * 1024,
+            sequential_prefetch_multiplier: 1,
+            client_part_size: 64 * 1024,
+            max_forward_seek_wait_distance: 400 * 1024,
+            max_backward_seek_distance: 400 * 1024,
+            cache_block_size: 512 * 1024,
         };
         run_random_read_test(PrefetcherType::Default, object_size, reads, config);
     }

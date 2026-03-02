@@ -12,10 +12,9 @@ use crate::checksums::ChecksummedBytes;
 use crate::data_cache::{BlockIndex, DataCache};
 use crate::mem_limiter::MemoryLimiter;
 use crate::object::ObjectId;
-use crate::prefetch::backpressure_controller::ReadWindowAlignmentConfig;
 
 use super::PrefetchReadError;
-use super::backpressure_controller::{BackpressureConfig, BackpressureLimiter, new_backpressure_controller};
+use super::controller::{PrefetchHeuristicConfig, PrefetchLimiter, new_prefetch_controller};
 use super::part::{Part, PartSource};
 use super::part_queue::{PartQueueProducer, unbounded_part_queue};
 use super::part_stream::{
@@ -51,18 +50,15 @@ where
 {
     fn spawn_get_object_request(&self, config: RequestTaskConfig) -> RequestTask<Client> {
         let range = config.range;
-
-        let backpressure_config = BackpressureConfig {
-            initial_read_window_size: config.initial_read_window_size(),
-            min_read_window_size: config.read_part_size,
-            max_read_window_size: config.max_read_window_size,
-            read_window_size_multiplier: config.read_window_size_multiplier,
-            request_range: range.into(),
-            read_window_alignment_config: ReadWindowAlignmentConfig::Disable, // we don't know where S3 request starts, so can not align the read window
-        };
+        let prefetch_heuristic_config = PrefetchHeuristicConfig::new(
+            config.max_read_window_size,
+            config.read_window_size_multiplier,
+            config.initial_read_window_size(),
+        );
         let (backpressure_controller, backpressure_limiter) =
-            new_backpressure_controller(backpressure_config, self.mem_limiter.clone());
-        let (part_queue, part_queue_producer) = unbounded_part_queue(self.mem_limiter.clone());
+            new_prefetch_controller(prefetch_heuristic_config, range, self.mem_limiter.clone());
+        let (part_queue, part_queue_producer) =
+            unbounded_part_queue(self.mem_limiter.clone(), backpressure_limiter.pushed_offset_counter());
         trace!(?range, "spawning request");
 
         let request_task = {
@@ -92,7 +88,7 @@ struct CachingRequest<Client: ObjectClient, Cache> {
     client: Client,
     cache: Arc<Cache>,
     runtime: Runtime,
-    backpressure_limiter: BackpressureLimiter,
+    backpressure_limiter: PrefetchLimiter,
     config: RequestTaskConfig,
 }
 
@@ -105,7 +101,7 @@ where
         client: Client,
         cache: Arc<Cache>,
         runtime: Runtime,
-        backpressure_limiter: BackpressureLimiter,
+        backpressure_limiter: PrefetchLimiter,
         config: RequestTaskConfig,
     ) -> Self {
         Self {
@@ -145,6 +141,17 @@ where
         // already likely negligible.
         let mut block_offset = block_range.start * block_size;
         for block_index in block_range.clone() {
+            if let Err(e) = self
+                .backpressure_limiter
+                .ensure_reserved_memory(
+                    block_offset..(block_offset + block_size).min(range.object_size() as u64),
+                    block_size as usize,
+                )
+                .await
+            {
+                part_queue_producer.push(Err(e));
+                break;
+            }
             match self
                 .cache
                 .get_block(cache_key, block_index, block_offset, range.object_size())
@@ -154,18 +161,8 @@ where
                     trace!(?cache_key, ?range, block_index, "cache hit");
                     // Cache blocks always contain bytes in the request range
                     let part = try_make_part(&block, block_offset, cache_key, &range, PartSource::Cache).unwrap();
-
                     part_queue_producer.push(Ok(part));
                     block_offset += block_size;
-
-                    if let Err(e) = self
-                        .backpressure_limiter
-                        .wait_for_read_window_increment(block_offset)
-                        .await
-                    {
-                        part_queue_producer.push(Err(e));
-                        break;
-                    }
                     continue;
                 }
                 Ok(None) => trace!(?cache_key, block_index, ?range, "cache miss - no data for block"),

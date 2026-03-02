@@ -6,7 +6,7 @@ use tracing::trace;
 use crate::mem_limiter::{BufferArea, MemoryLimiter};
 use crate::sync::Arc;
 use crate::sync::async_channel::{Receiver, RecvError, Sender, unbounded};
-use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::PrefetchReadError;
 use super::part::Part;
@@ -32,11 +32,13 @@ pub struct PartQueueProducer<E: std::error::Error> {
     sender: Sender<Result<Part, PrefetchReadError<E>>>,
     /// The total number of bytes sent to `self.sender`
     bytes_sent: Arc<AtomicUsize>,
+    sent_offset: Arc<AtomicU64>,
 }
 
 /// Creates an unbounded [PartQueue] and its related [PartQueueProducer].
 pub fn unbounded_part_queue<Client: ObjectClient>(
     mem_limiter: Arc<MemoryLimiter>,
+    sent_offset: Arc<AtomicU64>,
 ) -> (PartQueue<Client>, PartQueueProducer<Client::ClientError>) {
     let (sender, receiver) = unbounded();
     let bytes_counter = Arc::new(AtomicUsize::new(0));
@@ -50,6 +52,7 @@ pub fn unbounded_part_queue<Client: ObjectClient>(
     let part_queue_producer = PartQueueProducer {
         sender,
         bytes_sent: bytes_counter,
+        sent_offset,
     };
     (part_queue, part_queue_producer)
 }
@@ -125,6 +128,7 @@ impl<E: std::error::Error + Send + Sync> PartQueueProducer<E> {
         if send_result.is_err() {
             trace!("closed channel");
         } else {
+            self.sent_offset.fetch_add(part_len as u64, Ordering::SeqCst);
             self.bytes_sent.fetch_add(part_len, Ordering::SeqCst);
             metrics::gauge!("prefetch.bytes_in_queue").increment(part_len as f64);
         }
@@ -146,6 +150,8 @@ impl<Client: ObjectClient> Drop for PartQueue<Client> {
             queue_size += part.len()
         }
         metrics::gauge!("prefetch.bytes_in_queue").decrement(queue_size as f64);
+        trace!(queue_size, "PartQueue drop releasing memory");
+        self.mem_limiter.release(BufferArea::Prefetch, queue_size as u64);
     }
 }
 
@@ -177,7 +183,8 @@ mod tests {
         let pool = PagedPool::new_with_candidate_sizes([1024]);
         let mem_limiter = MemoryLimiter::new(pool, MINIMUM_MEM_LIMIT);
         let part_id = ObjectId::new("key".to_owned(), ETag::for_tests());
-        let (mut part_queue, part_queue_producer) = unbounded_part_queue::<MockClient>(mem_limiter.into());
+        let (mut part_queue, part_queue_producer) =
+            unbounded_part_queue::<MockClient>(mem_limiter.into(), Default::default());
         let mut current_offset = 0;
         let mut current_length = 0;
         for op in ops {

@@ -2,8 +2,7 @@ use futures::future::RemoteHandle;
 use mountpoint_s3_client::ObjectClient;
 
 use super::PrefetchReadError;
-use super::backpressure_controller::BackpressureController;
-use super::backpressure_controller::BackpressureFeedbackEvent::{DataRead, PartQueueStall};
+use super::controller::PrefetchController;
 use super::part::Part;
 use super::part_queue::PartQueue;
 use super::part_stream::RequestRange;
@@ -17,7 +16,7 @@ pub struct RequestTask<Client: ObjectClient> {
     remaining: usize,
     range: RequestRange,
     part_queue: PartQueue<Client>,
-    backpressure_controller: BackpressureController,
+    prefetch_controller: PrefetchController,
 }
 
 impl<Client: ObjectClient> RequestTask<Client> {
@@ -25,14 +24,14 @@ impl<Client: ObjectClient> RequestTask<Client> {
         task_handle: RemoteHandle<()>,
         range: RequestRange,
         part_queue: PartQueue<Client>,
-        backpressure_controller: BackpressureController,
+        backpressure_controller: PrefetchController,
     ) -> Self {
         Self {
             _task_handle: task_handle,
             remaining: range.len(),
             range,
             part_queue,
-            backpressure_controller,
+            prefetch_controller: backpressure_controller,
         }
     }
 
@@ -41,31 +40,28 @@ impl<Client: ObjectClient> RequestTask<Client> {
         // Iterate backwards to push each part to the front of the part queue
         for part in parts.into_iter().rev() {
             self.remaining += part.len();
+            self.prefetch_controller.backward_seek(part.len());
             self.part_queue.push_front(part).await?;
         }
         Ok(())
     }
 
     pub async fn read(&mut self, length: usize) -> Result<Part, PrefetchReadError<Client::ClientError>> {
+        self.prefetch_controller.update(length, self.available_offset()).await;
+
         let part = self.part_queue.read(length).await?;
         debug_assert!(part.len() <= self.remaining);
         self.remaining -= part.len();
 
-        // We read some data out of the part queue so the read window should be moved
-        self.backpressure_controller
-            .send_feedback(DataRead {
-                offset: part.offset(),
-                length: part.len(),
-            })
-            .await?;
+        self.prefetch_controller.mark_read(part.len(), part.offset());
 
-        let next_offset = part.offset() + part.len() as u64;
-        let remaining_in_queue = self.available_offset().saturating_sub(next_offset) as usize;
-        // If the part queue is empty it means we are reading faster than the task could prefetch,
-        // so we should use larger window for the task.
-        if remaining_in_queue == 0 {
-            self.backpressure_controller.send_feedback(PartQueueStall).await?;
-        }
+        // let next_offset = part.offset() + part.len() as u64;
+        // let remaining_in_queue = self.available_offset().saturating_sub(next_offset) as usize;
+        // // If the part queue is empty it means we are reading faster than the task could prefetch,
+        // // so we should use larger window for the task.
+        // if remaining_in_queue == 0 {
+        //     self.backpressure_controller.send_feedback(PartQueueStall).await?;
+        // }
 
         Ok(part)
     }
@@ -91,7 +87,7 @@ impl<Client: ObjectClient> RequestTask<Client> {
         self.start_offset() + self.part_queue.bytes_received() as u64
     }
 
-    pub fn read_window_end_offset(&self) -> u64 {
-        self.backpressure_controller.read_window_end_offset()
+    pub fn requested_offset(&self) -> u64 {
+        self.prefetch_controller.requested_offset()
     }
 }

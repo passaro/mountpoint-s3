@@ -759,6 +759,10 @@ impl ClientBackpressureHandle for MockBackpressureHandle {
     }
 
     fn ensure_read_window(&mut self, desired_end_offset: u64) {
+        trace!(
+            current_end_offset = self.read_window_end_offset(),
+            desired_end_offset, "incrementing read window"
+        );
         let diff = desired_end_offset.saturating_sub(self.read_window_end_offset()) as usize;
         self.increment_read_window(diff);
     }

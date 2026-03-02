@@ -1,15 +1,16 @@
-use std::{sync::atomic::Ordering, time::Instant};
+use std::time::Instant;
 
 use humansize::make_format;
 use metrics::atomics::AtomicU64;
 use tracing::{debug, trace};
 
 use crate::memory::{BufferKind, PagedPool};
+use crate::sync::atomic::Ordering;
 
 pub const MINIMUM_MEM_LIMIT: u64 = 512 * 1024 * 1024;
 
 /// Buffer areas that can be managed by the memory limiter. This is used for updating metrics.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum BufferArea {
     Upload,
     Prefetch,
@@ -90,8 +91,9 @@ impl MemoryLimiter {
     /// Reserve the memory for future uses. Always succeeds, even if it means going beyond
     /// the configured memory limit.
     pub fn reserve(&self, area: BufferArea, size: u64) {
-        self.mem_reserved.fetch_add(size, Ordering::SeqCst);
+        let previous = self.mem_reserved.fetch_add(size, Ordering::SeqCst);
         metrics::gauge!("mem.bytes_reserved", "area" => area.as_str()).increment(size as f64);
+        trace!(reserved = previous + size, increment = size, "reserved");
     }
 
     /// Reserve the memory for future uses. If there is not enough memory returns `false`.
@@ -121,6 +123,7 @@ impl MemoryLimiter {
                     metrics::gauge!("mem.bytes_reserved", "area" => area.as_str()).increment(size as f64);
                     metrics::histogram!("mem.reserve_latency_us", "area" => area.as_str())
                         .record(start.elapsed().as_micros() as f64);
+                    trace!(new_mem_reserved, increment = size, "reserved");
                     return true;
                 }
                 Err(current) => mem_reserved = current, // another thread updated the atomic before us, trying again
@@ -130,8 +133,14 @@ impl MemoryLimiter {
 
     /// Release the reserved memory.
     pub fn release(&self, area: BufferArea, size: u64) {
-        self.mem_reserved.fetch_sub(size, Ordering::SeqCst);
+        let previous = self.mem_reserved.fetch_sub(size, Ordering::SeqCst);
         metrics::gauge!("mem.bytes_reserved", "area" => area.as_str()).decrement(size as f64);
+        trace!(
+            previous,
+            new_mem_reserved = previous.saturating_sub(size),
+            decrement = size,
+            "release"
+        );
     }
 
     /// Query available memory tracked by the memory limiter.
@@ -154,5 +163,54 @@ impl MemoryLimiter {
         // * PutObject (multi-part uploads),
         // * Other (currently not used).
         (self.pool.reserved_bytes(BufferKind::PutObject) + self.pool.reserved_bytes(BufferKind::Other)) as u64
+    }
+
+    pub fn reserve_aligned(&self, area: BufferArea, size: u64, alignment: u64, minimum: u64) -> u64 {
+        let start = Instant::now();
+        let mut mem_reserved = self.mem_reserved.load(Ordering::SeqCst);
+        let increment = loop {
+            let pool_mem_reserved = self.pool_mem_reserved();
+            let total_mem_usage = mem_reserved
+                .saturating_add(pool_mem_reserved)
+                .saturating_add(self.additional_mem_reserved);
+            let available = self.mem_limit.saturating_sub(total_mem_usage);
+
+            let mut increment = size.next_multiple_of(alignment);
+            if increment > available {
+                let allowed = available.next_multiple_of(alignment).saturating_sub(alignment);
+                if allowed < minimum {
+                    trace!(requested = increment, available, allowed, "reducing to minimum");
+                    increment = minimum.next_multiple_of(alignment);
+                } else {
+                    trace!(
+                        requested = increment,
+                        available, allowed, "not enough memory to reserve"
+                    );
+                    increment = allowed;
+                }
+            }
+            let new_mem_reserved = mem_reserved.saturating_add(increment);
+
+            // Check that the value we have read is still the same before updating it
+            match self.mem_reserved.compare_exchange_weak(
+                mem_reserved,
+                new_mem_reserved,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    trace!(new_mem_reserved, increment, "reserved");
+                    break increment;
+                }
+                Err(current) => mem_reserved = current, // another thread updated the atomic before us, trying again
+            }
+        };
+
+        if increment > 0 {
+            metrics::gauge!("mem.bytes_reserved", "area" => area.as_str()).increment(increment as f64);
+        }
+        metrics::histogram!("mem.reserve_latency_us", "area" => area.as_str())
+            .record(start.elapsed().as_micros() as f64);
+        increment
     }
 }
