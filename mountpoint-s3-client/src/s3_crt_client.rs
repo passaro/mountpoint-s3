@@ -1059,6 +1059,12 @@ impl<'a> S3Message<'a> {
         self.inner.set_header(&header)
     }
 
+    /// Sets the body contents for this message, and returns any previously set contents.
+    /// If contents is None, unsets the body.
+    fn set_body_contents(&mut self, contents: Option<&'a [u8]>) -> Option<&'a [u8]> {
+        self.inner.set_body_contents(contents)
+    }
+
     fn into_options(self, operation: S3Operation) -> MetaRequestOptions<'a> {
         let mut options = MetaRequestOptions::new();
         if let Some(checksum_config) = self.checksum_config {
@@ -1534,12 +1540,12 @@ impl ObjectClient for S3CrtClient {
         self.put_object(bucket, key, params).await
     }
 
-    async fn put_object_single(
+    async fn put_object_single<'a>(
         &self,
         bucket: &str,
         key: &str,
         params: &PutObjectSingleParams,
-        contents: impl AsRef<[u8]> + Send + 'static,
+        contents: impl AsRef<[u8]> + Send + 'a,
     ) -> ObjectClientResult<PutObjectResult, PutObjectError, Self::ClientError> {
         self.put_object_single(bucket, key, params, contents).await
     }

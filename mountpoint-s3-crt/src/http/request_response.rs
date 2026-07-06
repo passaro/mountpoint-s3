@@ -11,7 +11,6 @@ use thiserror::Error;
 use crate::common::allocator::Allocator;
 use crate::common::error::Error;
 use crate::http::http_library_init;
-use crate::io::stream::InputStream;
 use crate::{CrtError, ToAwsByteCursor, aws_byte_cursor_as_slice};
 
 /// An HTTP header.
@@ -307,8 +306,8 @@ pub struct Message<'a> {
     /// The pointer to the inner `aws_http_message`.
     pub(crate) inner: NonNull<aws_http_message>,
 
-    /// Input stream for the body of the http message, if present.
-    body_input_stream: Option<InputStream<'a>>,
+    /// Slice for the body of the http message, if present.
+    pub(crate) body_contents: Option<&'a [u8]>,
 }
 
 impl<'a> Message<'a> {
@@ -322,7 +321,7 @@ impl<'a> Message<'a> {
 
         Ok(Self {
             inner,
-            body_input_stream: None,
+            body_contents: None,
         })
     }
 
@@ -375,26 +374,10 @@ impl<'a> Message<'a> {
         Ok(headers)
     }
 
-    /// Sets the body input stream for this message, and returns any previously set input stream.
-    /// If input_stream is None, unsets the body.
-    pub fn set_body_stream(&mut self, input_stream: Option<InputStream<'a>>) -> Option<InputStream<'a>> {
-        let old_input_stream = std::mem::replace(&mut self.body_input_stream, input_stream);
-
-        let new_input_stream_ptr = self
-            .body_input_stream
-            .as_ref()
-            .map(|s| s.inner.as_ptr())
-            .unwrap_or(std::ptr::null_mut());
-
-        // SAFETY: `aws_http_message_set_request_method` does _not_ take ownership of the underlying
-        // input stream. We take ownership of the input stream to make sure it doesn't get dropped
-        // while the CRT has a pointer to it. We also use lifetime parameters to enforce that this
-        // message does not outlive any data borrowed by the input stream.
-        unsafe {
-            aws_http_message_set_body_stream(self.inner.as_ptr(), new_input_stream_ptr);
-        }
-
-        old_input_stream
+    /// Sets the body contents for this message, and returns any previously set contents.
+    /// If contents is None, unsets the body.
+    pub fn set_body_contents(&mut self, contents: Option<&'a [u8]>) -> Option<&'a [u8]> {
+        std::mem::replace(&mut self.body_contents, contents)
     }
 }
 

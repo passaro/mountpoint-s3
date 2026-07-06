@@ -131,17 +131,18 @@ impl S3CrtClient {
         })
     }
 
-    pub(super) async fn put_object_single(
+    pub(super) async fn put_object_single<'a>(
         &self,
         bucket: &str,
         key: &str,
         params: &PutObjectSingleParams,
-        contents: impl AsRef<[u8]> + Send + 'static,
+        contents: impl AsRef<[u8]> + Send + 'a,
     ) -> ObjectClientResult<PutObjectResult, PutObjectError, S3RequestError> {
         let span = request_span!(self.inner, "put_object_single", bucket, key);
         let start_time = Instant::now();
 
-        let content_length = contents.as_ref().len();
+        let contents = contents.as_ref();
+        let content_length = contents.len();
         let request = {
             let mut message = self.new_put_request(
                 bucket,
@@ -153,6 +154,7 @@ impl S3CrtClient {
             message
                 .set_content_length_header(content_length)
                 .map_err(S3RequestError::construction_failure)?;
+            message.set_body_contents(Some(contents));
             if let Some(checksum) = &params.checksum {
                 message
                     .set_checksum_header(checksum)
@@ -180,15 +182,7 @@ impl S3CrtClient {
                     .map_err(S3RequestError::construction_failure)?;
             }
 
-            let mut options = message.into_options(S3Operation::PutObjectSingle);
-            if content_length > 0 {
-                // Zero-copy: move `contents` into the options so the CRT uploads directly from it
-                // with no extra allocation or copy. Ownership lives with the (leaked) options until
-                // the meta request is fully torn down, so the buffer stays valid across every send
-                // and retry even if this request future is dropped/cancelled first.
-                options.request_body(contents);
-            }
-
+            let options = message.into_options(S3Operation::PutObjectSingle);
             self.inner
                 .meta_request_with_headers_payload(options, span, parse_put_object_single_error)?
         };

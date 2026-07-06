@@ -177,12 +177,12 @@ where
         })
     }
 
-    async fn put_object_single(
+    async fn put_object_single<'a>(
         &self,
         bucket: &str,
         key: &str,
         params: &PutObjectSingleParams,
-        contents: impl AsRef<[u8]> + Send + 'static,
+        contents: impl AsRef<[u8]> + Send + 'a,
     ) -> ObjectClientResult<PutObjectResult, PutObjectError, Self::ClientError> {
         (self.put_object_single_cb)(&mut *self.state.lock().unwrap(), bucket, key, params, contents.as_ref())?;
         self.client.put_object_single(bucket, key, params, contents).await

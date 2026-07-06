@@ -1076,12 +1076,12 @@ impl ObjectClient for MockClient {
         Ok(put_request)
     }
 
-    async fn put_object_single(
+    async fn put_object_single<'a>(
         &self,
         bucket: &str,
         key: &str,
         params: &PutObjectSingleParams,
-        contents: impl AsRef<[u8]> + Send + 'static,
+        contents: impl AsRef<[u8]> + Send + 'a,
     ) -> ObjectClientResult<PutObjectResult, PutObjectError, Self::ClientError> {
         trace!(bucket, key, "PutObject");
         self.inc_op_count(Operation::PutObjectSingle);
