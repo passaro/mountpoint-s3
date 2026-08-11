@@ -1,6 +1,7 @@
 use std::{
     fmt,
     ops::{Bound, Range, RangeBounds},
+    sync::LazyLock,
 };
 
 use bytes::Bytes;
@@ -15,9 +16,23 @@ use mountpoint_s3_client::checksums::{
     crc32c_from_base64, crc32c_to_base64,
 };
 
+/// Whether integrity validation is disabled, read once from the environment.
+///
+/// Cached rather than read per call: this is consulted on every [`ChecksummedBytes::new`] and
+/// every [`ChecksummedBytes::validate`], so once per buffer on the read path. `env::var` walks
+/// `environ` and allocates a `String` on a hit, which is more per-buffer work than the CRC32C it
+/// is meant to avoid — reading it per call made *disabling* validation measurably slower than
+/// leaving it on.
+///
+/// Reading it once also makes the setting fixed for the process, which is the only coherent
+/// meaning for it: a buffer checksummed under one setting may be validated under another, and
+/// `LazyLock` guarantees both see the same answer.
+static INTEGRITY_VALIDATION_DISABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("EXPERIMENTAL_MOUNTPOINT_NO_DOWNLOAD_INTEGRITY_VALIDATION").is_some());
+
 /// Check if integrity validation is disabled via environment variable
 fn is_integrity_validation_disabled() -> bool {
-    std::env::var("EXPERIMENTAL_MOUNTPOINT_NO_DOWNLOAD_INTEGRITY_VALIDATION").is_ok()
+    *INTEGRITY_VALIDATION_DISABLED
 }
 
 /// A `ChecksummedBytes` is a bytes buffer that carries its checksum.

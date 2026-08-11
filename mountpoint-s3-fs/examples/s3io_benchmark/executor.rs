@@ -1,10 +1,13 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Instant;
 
+use async_trait::async_trait;
 use mountpoint_s3_client::config::{Allocator, EndpointConfig, S3ClientConfig, Uri};
 use mountpoint_s3_client::types::HeadObjectParams;
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
+use mountpoint_s3_fs::data::{DataPlane, ObjectSpec, PrefetchDataPlane, Reader};
 use mountpoint_s3_fs::memory::effective_total_memory;
 use mountpoint_s3_fs::memory::{CandidateSize, PagedPool};
 use mountpoint_s3_fs::object::ObjectId;
@@ -15,8 +18,10 @@ use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg64;
 use thiserror::Error;
 
-use crate::config::{AccessPattern, ChecksumAlgorithm, GlobalConfig, ResolvedJobConfig, SseType, WorkloadType};
-use crate::results::{ErrorInfo, JobResult};
+use crate::config::{
+    AccessPattern, ChecksumAlgorithm, DataPlaneKind, GlobalConfig, ResolvedJobConfig, SseType, WorkloadType,
+};
+use crate::results::{ErrorInfo, JobResult, ReadStats};
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {
@@ -33,92 +38,233 @@ pub enum ExecutionError {
     ResourceInitError(String),
 }
 
-pub struct Executor {
-    pub client: S3CrtClient,
-    pub uploader: Uploader<S3CrtClient>,
-    prefetcher: Prefetcher<S3CrtClient>,
+/// Runs benchmark jobs, whatever data plane serves the reads.
+#[async_trait]
+pub trait Executor: Send + Sync {
+    async fn execute_read_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError>;
+    async fn execute_write_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError>;
 }
 
-impl Executor {
-    pub fn new(global: &GlobalConfig) -> Result<Self, ExecutionError> {
-        let region = global.region.as_deref().unwrap_or("us-east-1");
-        let read_part_size = global.read_part_size.unwrap_or(8 * 1024 * 1024);
-        let write_part_size = global.write_part_size.unwrap_or(8 * 1024 * 1024);
+/// The one implementation, generic over the read backend.
+///
+/// Only the two read methods use `D`. The write path is the same for every backend — the data
+/// plane covers reads only, and both arms upload through `upload::Uploader` — which is why there
+/// is no writer counterpart to the read plane here.
+struct ExecutorImpl<D: DataPlane> {
+    client: S3CrtClient,
+    uploader: Uploader<S3CrtClient>,
+    read_plane: D,
+}
 
-        let memory_target = global
-            .memory_target
-            .unwrap_or_else(|| ((effective_total_memory() as f64 * 0.95) / (1024.0 * 1024.0)) as usize);
+/// Build the configured data plane and an executor over it.
+///
+/// The only place a data plane type is named. Each arm builds its own concrete `ExecutorImpl`
+/// and erases it immediately, which is what keeps the type parameter inside this module — a
+/// `match` cannot return two types, but each arm can produce its own trait object.
+pub fn build_executor(global: &GlobalConfig) -> Result<Arc<dyn Executor>, ExecutionError> {
+    let S3Resources {
+        client,
+        uploader,
+        runtime,
+        pool,
+    } = build_s3(global)?;
 
-        let bind = global.bind.clone().unwrap_or_default();
-
-        let sse_type = global.sse.map(|sse| match sse {
-            SseType::Aes256 => "AES256".to_string(),
-            SseType::AwsKms => "aws:kms".to_string(),
-        });
-
-        let checksum_algorithm = match global.checksum_algorithm.unwrap_or(ChecksumAlgorithm::Crc32c) {
-            ChecksumAlgorithm::Crc64nvme => Some(mountpoint_s3_client::types::ChecksumAlgorithm::Crc64nvme),
-            ChecksumAlgorithm::Crc32c => Some(mountpoint_s3_client::types::ChecksumAlgorithm::Crc32c),
-            ChecksumAlgorithm::Crc32 => Some(mountpoint_s3_client::types::ChecksumAlgorithm::Crc32),
-            ChecksumAlgorithm::Sha1 => Some(mountpoint_s3_client::types::ChecksumAlgorithm::Sha1),
-            ChecksumAlgorithm::Sha256 => Some(mountpoint_s3_client::types::ChecksumAlgorithm::Sha256),
-            ChecksumAlgorithm::Off => None,
-        };
-
-        let memory_target_bytes = memory_target * 1024 * 1024;
-        let pool = PagedPool::config()
-            .with_candidate_sizes([CandidateSize::new(read_part_size), CandidateSize::new(write_part_size)])
-            .with_memory_limit(memory_target_bytes)
-            .build();
-
-        let mut endpoint_config = EndpointConfig::new(region);
-        if let Some(url) = &global.endpoint_url {
-            let endpoint_uri = Uri::new_from_str(&Allocator::default(), url)
-                .map_err(|e| ExecutionError::ResourceInitError(format!("Failed to parse endpoint URL: {}", e)))?;
-            endpoint_config = endpoint_config.endpoint(endpoint_uri);
+    match global.data_plane {
+        DataPlaneKind::Prefetcher => {
+            let prefetcher =
+                Prefetcher::default_builder(client.clone()).build(runtime, pool, PrefetcherConfig::default());
+            Ok(Arc::new(ExecutorImpl {
+                client,
+                uploader,
+                read_plane: PrefetchDataPlane::new(prefetcher),
+            }))
         }
-
-        let mut client_config = S3ClientConfig::new()
-            .endpoint_config(endpoint_config)
-            .read_backpressure(true)
-            .initial_read_window(read_part_size)
-            .write_part_size(write_part_size)
-            .memory_pool(pool.clone());
-
-        if let Some(throughput_gbps) = global.throughput_target_gbps {
-            client_config = client_config.throughput_target_gbps(throughput_gbps);
+        #[cfg(feature = "rtm_data_plane")]
+        DataPlaneKind::Rtm => {
+            let read_plane = build_rtm_plane(global)?;
+            Ok(Arc::new(ExecutorImpl {
+                client,
+                uploader,
+                read_plane,
+            }))
         }
+        #[cfg(not(feature = "rtm_data_plane"))]
+        DataPlaneKind::Rtm => Err(ExecutionError::ResourceInitError(
+            crate::config::RTM_ERROR_STRING.to_string(),
+        )),
+    }
+}
 
-        if !bind.is_empty() {
-            client_config = client_config.network_interface_names(bind);
-        }
+/// The client and uploader alone, for callers that need S3 access but no data plane.
+///
+/// Test-object generation is the one such caller. It shares this rather than building an
+/// executor it would use two fields of — which under `data_plane = "rtm"` also meant standing up
+/// a second `aws_sdk_s3::Client` and transfer manager it never read a byte through.
+pub fn build_client_and_uploader(
+    global: &GlobalConfig,
+) -> Result<(S3CrtClient, Uploader<S3CrtClient>), ExecutionError> {
+    let resources = build_s3(global)?;
+    Ok((resources.client, resources.uploader))
+}
 
-        let client = S3CrtClient::new(client_config)
-            .map_err(|e| ExecutionError::ResourceInitError(format!("Failed to create S3 client: {}", e)))?;
+/// Everything an executor needs that does not depend on which data plane serves reads.
+struct S3Resources {
+    client: S3CrtClient,
+    uploader: Uploader<S3CrtClient>,
+    /// Handed back rather than consumed, because `Prefetcher::build` takes both by value and
+    /// only the prefetcher arm wants them.
+    runtime: Runtime,
+    pool: PagedPool,
+}
 
-        let runtime = Runtime::new(client.event_loop_group());
+/// The configured read part size, or the default. Shared by [`build_s3`] and the RTM builder,
+/// which size different things from it.
+fn read_part_size(global: &GlobalConfig) -> usize {
+    global.read_part_size.unwrap_or(8 * 1024 * 1024)
+}
 
-        let server_side_encryption = ServerSideEncryption::new(sse_type, global.sse_kms_key_id.clone());
+/// Build the S3 client, buffer pool, runtime, and uploader from config.
+fn build_s3(global: &GlobalConfig) -> Result<S3Resources, ExecutionError> {
+    let region = global.region.as_deref().unwrap_or("us-east-1");
+    let read_part_size = read_part_size(global);
+    let write_part_size = global.write_part_size.unwrap_or(8 * 1024 * 1024);
 
-        let uploader = Uploader::new(
-            client.clone(),
-            runtime.clone(),
-            pool.clone(),
-            UploaderConfig::new(write_part_size)
-                .server_side_encryption(server_side_encryption)
-                .default_checksum_algorithm(checksum_algorithm),
-        );
+    let memory_target = global
+        .memory_target
+        .unwrap_or_else(|| ((effective_total_memory() as f64 * 0.95) / (1024.0 * 1024.0)) as usize);
 
-        let prefetcher = Prefetcher::default_builder(client.clone()).build(runtime, pool, PrefetcherConfig::default());
+    let bind = global.bind.clone().unwrap_or_default();
 
-        Ok(Self {
-            client,
-            uploader,
-            prefetcher,
-        })
+    let sse_type = global.sse.map(|sse| match sse {
+        SseType::Aes256 => "AES256".to_string(),
+        SseType::AwsKms => "aws:kms".to_string(),
+    });
+
+    let checksum_algorithm = match global.checksum_algorithm.unwrap_or(ChecksumAlgorithm::Crc32c) {
+        ChecksumAlgorithm::Crc64nvme => Some(mountpoint_s3_client::types::ChecksumAlgorithm::Crc64nvme),
+        ChecksumAlgorithm::Crc32c => Some(mountpoint_s3_client::types::ChecksumAlgorithm::Crc32c),
+        ChecksumAlgorithm::Crc32 => Some(mountpoint_s3_client::types::ChecksumAlgorithm::Crc32),
+        ChecksumAlgorithm::Sha1 => Some(mountpoint_s3_client::types::ChecksumAlgorithm::Sha1),
+        ChecksumAlgorithm::Sha256 => Some(mountpoint_s3_client::types::ChecksumAlgorithm::Sha256),
+        ChecksumAlgorithm::Off => None,
+    };
+
+    let memory_target_bytes = memory_target * 1024 * 1024;
+    let pool = PagedPool::config()
+        .with_candidate_sizes([CandidateSize::new(read_part_size), CandidateSize::new(write_part_size)])
+        .with_memory_limit(memory_target_bytes)
+        .build();
+
+    let mut endpoint_config = EndpointConfig::new(region);
+    if let Some(url) = &global.endpoint_url {
+        let endpoint_uri = Uri::new_from_str(&Allocator::default(), url)
+            .map_err(|e| ExecutionError::ResourceInitError(format!("Failed to parse endpoint URL: {}", e)))?;
+        endpoint_config = endpoint_config.endpoint(endpoint_uri);
     }
 
-    pub async fn execute_read_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
+    let mut client_config = S3ClientConfig::new()
+        .endpoint_config(endpoint_config)
+        .read_backpressure(true)
+        .initial_read_window(read_part_size)
+        .write_part_size(write_part_size)
+        .memory_pool(pool.clone());
+
+    if let Some(throughput_gbps) = global.throughput_target_gbps {
+        client_config = client_config.throughput_target_gbps(throughput_gbps);
+    }
+
+    if !bind.is_empty() {
+        client_config = client_config.network_interface_names(bind);
+    }
+
+    let client = S3CrtClient::new(client_config)
+        .map_err(|e| ExecutionError::ResourceInitError(format!("Failed to create S3 client: {}", e)))?;
+
+    let runtime = Runtime::new(client.event_loop_group());
+
+    let server_side_encryption = ServerSideEncryption::new(sse_type, global.sse_kms_key_id.clone());
+
+    let uploader = Uploader::new(
+        client.clone(),
+        runtime.clone(),
+        pool.clone(),
+        UploaderConfig::new(write_part_size)
+            .server_side_encryption(server_side_encryption)
+            .default_checksum_algorithm(checksum_algorithm),
+    );
+
+    Ok(S3Resources {
+        client,
+        uploader,
+        runtime,
+        pool,
+    })
+}
+
+/// Build the RTM-backed data plane.
+///
+/// Note this constructs a *second* S3 client — an `aws_sdk_s3::Client` alongside the
+/// `S3CrtClient` the uploader and HeadObject calls use. Both exist in the process during
+/// a run, with separate connection pools and TLS stacks. That is inherent to running the
+/// two data planes in one binary, and worth remembering when reading memory figures.
+#[cfg(feature = "rtm_data_plane")]
+fn build_rtm_plane(global: &GlobalConfig) -> Result<mountpoint_s3_fs::data::RtmDataPlane, ExecutionError> {
+    use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, TargetThroughput};
+    use mountpoint_s3_fs::data::{RtmConfig, RtmDataPlane};
+
+    let read_part_size = read_part_size(global);
+    let region = global.region.clone().unwrap_or_else(|| "us-east-1".to_string());
+
+    // `load_defaults` is async; the executor is built from sync context, so block on it.
+    let sdk_config = futures::executor::block_on(async {
+        let mut loader =
+            aws_config::defaults(aws_config::BehaviorVersion::latest()).region(aws_config::Region::new(region.clone()));
+        if let Some(url) = &global.endpoint_url {
+            loader = loader.endpoint_url(url);
+        }
+        loader.load().await
+    });
+    let s3 = aws_sdk_s3::Client::new(&sdk_config);
+
+    let mut tm_builder = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(s3)
+        .part_size(PartSize::Target(read_part_size as u64));
+    if let Some(gbps) = global.throughput_target_gbps {
+        tm_builder = tm_builder.concurrency(ConcurrencyMode::TargetThroughput(
+            TargetThroughput::new_gigabits_per_sec(gbps as u64),
+        ));
+    }
+    // Apply `memory_target` to the transfer manager.
+    if let Some(mib) = global.memory_target {
+        tm_builder = tm_builder.memory_budget(MemoryBudgetConfig::Limit(mib * 1024 * 1024));
+    }
+    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_builder.build());
+    let mut config = RtmConfig::default();
+    if let Some(bytes) = global.rtm_read_ahead_bytes {
+        config.max_read_ahead_bytes = bytes;
+    }
+    if let Some(bytes) = global.rtm_initial_request_size {
+        config.initial_request_size = bytes;
+    }
+
+    // The transfer manager is built with an explicit `PartSize::Target` above, so the data plane can
+    // divide the byte read-ahead ceiling by it exactly rather than assuming a default.
+    Ok(RtmDataPlane::new(tm, config))
+}
+
+#[async_trait]
+impl<D: DataPlane + 'static> Executor for ExecutorImpl<D> {
+    async fn execute_read_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
+        self.execute_read_job(config).await
+    }
+
+    async fn execute_write_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
+        self.execute_write_job(config).await
+    }
+}
+
+impl<D: DataPlane> ExecutorImpl<D> {
+    async fn execute_read_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
         if config.workload_type != WorkloadType::Read {
             return Err(ExecutionError::ExecutionFailed(
                 "execute_read_job can only execute read workloads".to_string(),
@@ -131,7 +277,7 @@ impl Executor {
         }
     }
 
-    pub async fn execute_write_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
+    async fn execute_write_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
         if config.workload_type != WorkloadType::Write {
             return Err(ExecutionError::ExecutionFailed(
                 "execute_write_job can only execute write workloads".to_string(),
@@ -147,7 +293,6 @@ impl Executor {
 
     async fn execute_sequential_read(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
         let client = &self.client;
-        let prefetcher = &self.prefetcher;
         let bucket = &config.bucket;
         let object_key = &config.object_key;
 
@@ -156,12 +301,14 @@ impl Executor {
             .await
             .map_err(|e| ExecutionError::S3Error(format!("HeadObject failed: {}", e)))?;
 
-        let object_id = ObjectId::new(object_key.to_string(), head_result.etag);
+        let etag = head_result.etag;
         let size = head_result.size;
+        let object_spec = ObjectSpec::new(bucket.clone(), object_key.clone(), etag.as_str(), size);
 
         let mut total_bytes = 0u64;
         let mut errors = Vec::new();
         let mut iterations_completed = 0usize;
+        let mut read_stats = ReadStats::default();
 
         let job_start = Instant::now();
         let max_duration = config.max_duration;
@@ -173,7 +320,7 @@ impl Executor {
                 break;
             }
 
-            let mut request = prefetcher.prefetch(bucket.to_string(), object_id.clone(), size);
+            let request = self.read_plane.open_read(object_spec.clone());
             let mut offset = 0;
             while offset < size {
                 if let Some(max_dur) = max_duration
@@ -184,10 +331,12 @@ impl Executor {
 
                 let read_size = std::cmp::min(config.read_size as u64, size - offset);
 
-                match request.read(offset, read_size as usize).await {
-                    Ok(bytes) => {
-                        let bytes_read = bytes.len() as u64;
-
+                match request.read_at(offset, read_size as usize).await {
+                    Ok(segments) => {
+                        let chunks = segments.chunk_count();
+                        let buffer = segments.to_contiguous();
+                        read_stats.add_read(buffer.len(), chunks);
+                        let bytes_read = buffer.len() as u64;
                         offset += bytes_read;
                         total_bytes += bytes_read;
                     }
@@ -200,6 +349,8 @@ impl Executor {
                     }
                 }
             }
+
+            read_stats.add(request.stats());
 
             if offset >= size {
                 iterations_completed += 1;
@@ -215,12 +366,12 @@ impl Executor {
             total_bytes,
             elapsed_seconds: duration,
             errors,
+            read_stats: Some(read_stats),
         })
     }
 
     async fn execute_random_read(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
         let client = &self.client;
-        let prefetcher = &self.prefetcher;
         let bucket = &config.bucket;
         let object_key = &config.object_key;
 
@@ -229,12 +380,15 @@ impl Executor {
             .await
             .map_err(|e| ExecutionError::S3Error(format!("HeadObject failed: {}", e)))?;
 
+        let etag = head_result.etag.clone();
         let object_id = ObjectId::new(object_key.to_string(), head_result.etag);
         let size = head_result.size;
+        let object_spec = ObjectSpec::new(bucket.clone(), object_key.clone(), etag.as_str(), size);
 
         let mut total_bytes = 0u64;
         let mut errors = Vec::new();
         let mut iterations_completed = 0usize;
+        let mut read_stats = ReadStats::default();
 
         let job_start = Instant::now();
         let max_duration = config.max_duration;
@@ -248,7 +402,7 @@ impl Executor {
             }
 
             let iteration_start = Instant::now();
-            let mut request = prefetcher.prefetch(bucket.to_string(), object_id.clone(), size);
+            let request = self.read_plane.open_read(object_spec.clone());
 
             // Create a unique, deterministic seed by combining randseed with object_id hash
             // and iteration. This ensures each object/iteration has a different but reproducible
@@ -289,10 +443,12 @@ impl Executor {
                 let offset = rng.random_range(0..=max_offset);
                 let read_size = std::cmp::min(config.read_size as u64, size - offset);
 
-                match request.read(offset, read_size as usize).await {
-                    Ok(bytes) => {
-                        let bytes_read = bytes.len() as u64;
-
+                match request.read_at(offset, read_size as usize).await {
+                    Ok(segments) => {
+                        let chunks = segments.chunk_count();
+                        let buffer = segments.to_contiguous();
+                        read_stats.add_read(buffer.len(), chunks);
+                        let bytes_read = buffer.len() as u64;
                         bytes_read_this_iteration += bytes_read;
                         total_bytes += bytes_read;
                     }
@@ -306,6 +462,8 @@ impl Executor {
                     }
                 }
             }
+
+            read_stats.add(request.stats());
 
             if completed_successfully && !timed_out {
                 iterations_completed += 1;
@@ -321,6 +479,7 @@ impl Executor {
             total_bytes,
             elapsed_seconds: duration,
             errors,
+            read_stats: Some(read_stats),
         })
     }
 
@@ -415,6 +574,7 @@ impl Executor {
             total_bytes,
             elapsed_seconds: duration,
             errors,
+            read_stats: None,
         }
     }
 
@@ -504,6 +664,7 @@ impl Executor {
             total_bytes,
             elapsed_seconds: duration,
             errors,
+            read_stats: None,
         }
     }
 }

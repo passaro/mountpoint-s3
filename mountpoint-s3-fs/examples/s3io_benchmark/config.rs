@@ -6,6 +6,9 @@ use thiserror::Error;
 
 use crate::test_object_generator::generate_test_objects;
 
+#[cfg(not(feature = "rtm_data_plane"))]
+pub const RTM_ERROR_STRING: &'static str = "data_plane = \"rtm\" requires building with --features rtm_data_plane";
+
 /// Top-level configuration structure
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Config {
@@ -32,6 +35,19 @@ pub struct GlobalConfig {
     /// Memory monitoring polling interval. Default: 100ms.
     #[serde(default, with = "humantime_serde")]
     pub memory_monitor_interval: Option<Duration>,
+    /// Which data plane serves reads. Default: `prefetcher`.
+    #[serde(default)]
+    pub data_plane: DataPlaneKind,
+
+    /// Ceiling on read-ahead in bytes, for `data_plane = "rtm"`. A maximum, not a fixed depth: a
+    /// cursor starts at one part and grows towards this while reads keep stalling. Rounded down to
+    /// a whole number of parts. Default: the same 2 GiB the prefetcher uses.
+    pub rtm_read_ahead_bytes: Option<usize>,
+
+    /// Bytes a cursor's first request covers, for `data_plane = "rtm"`, before a follow-on request
+    /// to the end of the object. This is what bounds what a small read costs. Default: the same
+    /// 1 MiB + 128 KiB the prefetcher uses.
+    pub rtm_initial_request_size: Option<u64>,
 
     // === Job defaults (optional, overridable per job) ===
     #[serde(flatten)]
@@ -101,6 +117,22 @@ pub enum AccessPattern {
     Random,
 }
 
+/// Which data plane serves read workloads.
+///
+/// The default is the existing CRT-backed prefetcher, so an unmodified config file behaves
+/// exactly as before. `rtm` selects the experimental
+/// [`RtmDataPlane`](mountpoint_s3_fs::data::RtmDataPlane) and requires the crate's
+/// `rtm_data_plane` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DataPlaneKind {
+    /// The existing `Prefetcher`, via `mountpoint_s3_fs::data::PrefetchDataPlane`.
+    #[default]
+    Prefetcher,
+    /// The AWS S3 Transfer Manager for Rust.
+    Rtm,
+}
+
 /// Server-side encryption type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum SseType {
@@ -151,8 +183,21 @@ pub fn parse_config_string(content: &str) -> Result<Config, ConfigError> {
     Ok(toml::from_str(content)?)
 }
 
+/// Reject an unavailable data plane before any work happens.
+pub fn check_data_plane(global: &GlobalConfig) -> Result<(), ConfigError> {
+    match global.data_plane {
+        DataPlaneKind::Prefetcher => Ok(()),
+        #[cfg(feature = "rtm_data_plane")]
+        DataPlaneKind::Rtm => Ok(()),
+        #[cfg(not(feature = "rtm_data_plane"))]
+        DataPlaneKind::Rtm => Err(ConfigError::Validation(RTM_ERROR_STRING.to_string())),
+    }
+}
+
 /// Prepare jobs by resolving configuration inheritance and validating
 pub async fn prepare_jobs(config: Config) -> Result<Vec<ResolvedJobConfig>, ConfigError> {
+    check_data_plane(&config.global)?;
+
     // Validate global network interfaces if specified
     if let Some(bind) = &config.global.bind {
         if bind.is_empty() {
@@ -286,4 +331,50 @@ fn merge_and_resolve(job_name: &str, job: &JobConfig, global: &GlobalConfig) -> 
         iteration_duration,
         generate_object,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unmodified config file must keep using the existing prefetcher.
+    #[test]
+    fn data_plane_defaults_to_prefetcher() {
+        let toml = r#"
+            [global]
+            bucket = "b"
+            [jobs.j]
+            workload_type = "read"
+        "#;
+        let config: Config = toml::from_str(toml).expect("parses");
+        assert_eq!(config.global.data_plane, DataPlaneKind::Prefetcher);
+        assert_eq!(config.global.rtm_read_ahead_bytes, None);
+    }
+
+    #[test]
+    fn data_plane_and_rtm_knobs_parse() {
+        let toml = r#"
+            [global]
+            bucket = "b"
+            data_plane = "rtm"
+            rtm_read_ahead_bytes = 16777216
+            [jobs.j]
+            workload_type = "read"
+        "#;
+        let config: Config = toml::from_str(toml).expect("parses");
+        assert_eq!(config.global.data_plane, DataPlaneKind::Rtm);
+        assert_eq!(config.global.rtm_read_ahead_bytes, Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn unknown_data_plane_is_rejected() {
+        let toml = r#"
+            [global]
+            bucket = "b"
+            data_plane = "nonsense"
+            [jobs.j]
+            workload_type = "read"
+        "#;
+        assert!(toml::from_str::<Config>(toml).is_err());
+    }
 }

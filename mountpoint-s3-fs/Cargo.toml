@@ -11,6 +11,17 @@ description = "Mountpoint S3 main library"
 mountpoint-s3-fuser = { workspace = true }
 mountpoint-s3-client = { workspace = true }
 
+# Experimental: the RTM-backed data plane in `mountpoint-s3-fs::data`. Optional, and the
+# mountpoint-s3 binary does not enable the feature, so it stays out of release builds.
+#
+# Pinned to an exact upstream commit rather than a crates.io version, so upstream churn in a
+# fast-moving crate is opt-in. The published 0.2.0 is the same tree as this rev.
+aws-sdk-s3-transfer-manager = { git = "https://github.com/awslabs/aws-s3-transfer-manager-rs.git", rev = "71aa144a", optional = true }
+
+# jemalloc for the `s3io_benchmark` example only, behind the `jemalloc` feature. The maintained tikv
+# fork rather than the unmaintained `jemallocator` the RTM's own example pins.
+tikv-jemallocator = { version = "0.7", optional = true }
+
 anyhow = { version = "1.0.103", features = ["backtrace"] }
 async-channel = "2.5.0"
 async-lock = "3.4.2"
@@ -92,6 +103,12 @@ wiremock = "0.6.5"
 # Unreleased and/or experimental features: not enabled in the release binary and may be dropped in future
 block_size = []
 event_log = []
+# Experimental RTM-backed data plane (mountpoint-s3-fs::data). Example/test use only.
+rtm_data_plane = ["aws-sdk-s3-transfer-manager"]
+# Link jemalloc as the global allocator in the `s3io_benchmark` example, for measuring how much of
+# that example's resident memory is allocator behaviour rather than buffers actually in use. Affects
+# only the example: a `#[global_allocator]` in a library has no effect on anything that links it.
+jemalloc = ["tikv-jemallocator"]
 manifest = ["csv", "rusqlite"]
 
 # Features for choosing tests
@@ -102,6 +119,19 @@ s3express_tests = []
 shuttle = []
 second_account_tests = []
 stress_tests = ["s3_tests", "fuse_tests"]
+
+# The data-plane tests need the RTM, so they only build with the feature on.
+[[test]]
+name = "data_plane_conformance"
+required-features = ["rtm_data_plane"]
+
+[[test]]
+name = "data_plane_read_ahead"
+required-features = ["rtm_data_plane"]
+
+[[test]]
+name = "data_plane_priority"
+required-features = ["rtm_data_plane"]
 
 [[example]]
 name = "mount_from_config"

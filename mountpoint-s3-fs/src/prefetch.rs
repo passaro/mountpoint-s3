@@ -156,7 +156,11 @@ impl Default for PrefetcherConfig {
 ///
 /// This unstable override is expected to be removed once adaptive prefetching based on available memory is available:
 /// https://github.com/awslabs/mountpoint-s3/issues/987
-fn determine_max_read_size() -> usize {
+///
+/// `pub(crate)` so the RTM data plane can default its own read-ahead ceiling to the same value:
+/// comparing the two read paths only means something if both speculate up to the same budget, and
+/// sharing this keeps them in step under the override above rather than only at the default.
+pub(crate) fn determine_max_read_size() -> usize {
     const ENV_VAR_KEY: &str = "UNSTABLE_MOUNTPOINT_MAX_PREFETCH_WINDOW_SIZE";
     const DEFAULT_READ_WINDOW_SIZE: usize = 2 * 1024 * 1024 * 1024;
 

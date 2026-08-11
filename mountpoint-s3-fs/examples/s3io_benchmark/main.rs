@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use config::{WorkloadType, parse_config_file, prepare_jobs};
-use executor::Executor;
+use executor::build_executor;
 use monitoring::MemoryMonitor;
 use results::BenchmarkResults;
 use tikv_jemallocator::Jemalloc;
@@ -65,7 +65,7 @@ async fn run_benchmark() -> Result<()> {
     }
 
     eprintln!("Creating shared resources...");
-    let executor = Arc::new(Executor::new(&config.global).context("Failed to create executor")?);
+    let executor = build_executor(&config.global).context("Failed to create executor")?;
 
     // Start memory monitoring
     let mut memory_monitor = MemoryMonitor::default();
