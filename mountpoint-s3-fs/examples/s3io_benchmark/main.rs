@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use config::{WorkloadType, parse_config_file, prepare_jobs};
-use executor::Executor;
+use executor::build_executor;
 use monitoring::MemoryMonitor;
 use results::BenchmarkResults;
 use tikv_jemallocator::Jemalloc;
@@ -21,8 +21,14 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 // Keep in sync with the `mount-s3` binary's jemalloc config, see `mountpoint-s3/src/main.rs`.
+#[cfg(not(feature = "jemalloc_conf"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static MALLOC_CONF: &[u8] = b"abort_conf:true,background_thread:true,narenas:32\0";
+
+#[cfg(feature = "jemalloc_conf")]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8] =
+    b"abort_conf:true,background_thread:true,narenas:32,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 #[derive(Parser, Debug)]
 #[command(name = "s3io_benchmark")]
@@ -64,7 +70,7 @@ async fn run_benchmark() -> Result<()> {
     }
 
     eprintln!("Creating shared resources...");
-    let executor = Arc::new(Executor::new(&config.global).context("Failed to create executor")?);
+    let executor = build_executor(&config.global).context("Failed to create executor")?;
 
     // Start memory monitoring
     let mut memory_monitor = MemoryMonitor::default();

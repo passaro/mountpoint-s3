@@ -11,6 +11,14 @@ description = "Mountpoint S3 main library"
 mountpoint-s3-fuser = { workspace = true }
 mountpoint-s3-client = { workspace = true }
 
+# Experimental: the RTM-backed data plane in `mountpoint-s3-fs::data`. Optional, and the
+# mountpoint-s3 binary does not enable the feature, so it stays out of release builds.
+#
+# Pinned to an exact upstream commit rather than a crates.io version. This rev is `main`
+# at f4c8f46, which adds unknown-length streaming uploads (PR #164): the write path
+# relies on it. Swap for a release tag once one lands past #164.
+aws-sdk-s3-transfer-manager = { git = "https://github.com/awslabs/aws-s3-transfer-manager-rs.git", rev = "f4c8f46", optional = true }
+
 anyhow = { version = "1.0.103", features = ["backtrace"] }
 async-channel = "2.5.0"
 async-lock = "3.4.2"
@@ -92,6 +100,10 @@ wiremock = "0.6.5"
 # Unreleased and/or experimental features: not enabled in the release binary and may be dropped in future
 block_size = []
 event_log = []
+# Experimental RTM-backed data plane (mountpoint-s3-fs::data). Example/test use only.
+rtm_data_plane = ["aws-sdk-s3-transfer-manager"]
+# Use alternative configuration for jemalloc.
+jemalloc_conf = []
 manifest = ["csv", "rusqlite"]
 
 # Features for choosing tests
