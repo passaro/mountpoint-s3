@@ -1,9 +1,10 @@
-use mountpoint_s3_client::ObjectClient;
 use mountpoint_s3_client::types::HeadObjectParams;
+use mountpoint_s3_client::{ObjectClient, S3CrtClient};
+use mountpoint_s3_fs::upload::Uploader;
 use thiserror::Error;
 
 use crate::config::{GlobalConfig, ResolvedJobConfig, WorkloadType};
-use crate::executor::Executor;
+use crate::executor::build_client_and_uploader;
 
 /// S3 multipart upload has a hard limit of 10,000 parts per upload
 /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
@@ -17,8 +18,9 @@ pub enum ObjectGenerationError {
     Upload { key: String, reason: String },
 }
 
-// Note: This intentionally creates a separate Executor instance to ensure
-// test object generation doesn't influence benchmark jobs
+// Note: This intentionally creates a separate client and uploader to ensure test object
+// generation doesn't influence benchmark jobs. It needs no data plane at all — generation only
+// writes — so it does not build one.
 pub async fn generate_test_objects(
     jobs: &[ResolvedJobConfig],
     global: &GlobalConfig,
@@ -49,11 +51,11 @@ pub async fn generate_test_objects(
         );
     }
 
-    let executor = Executor::new(&adjusted_global).map_err(|e| ObjectGenerationError::Setup(e.to_string()))?;
+    let (client, uploader) =
+        build_client_and_uploader(&adjusted_global).map_err(|e| ObjectGenerationError::Setup(e.to_string()))?;
     for job in jobs_requiring_generation {
         // Skip generation if object already exists with correct size
-        match executor
-            .client
+        match client
             .head_object(&job.bucket, &job.object_key, &HeadObjectParams::new())
             .await
         {
@@ -79,7 +81,7 @@ pub async fn generate_test_objects(
             }
         }
 
-        upload_test_object(&executor, &job.bucket, &job.object_key, job.object_size, job.write_size).await?;
+        upload_test_object(&uploader, &job.bucket, &job.object_key, job.object_size, job.write_size).await?;
         eprintln!(
             "Generated test object for job '{}': key={}, size={} bytes",
             job.name, job.object_key, job.object_size
@@ -90,14 +92,13 @@ pub async fn generate_test_objects(
 }
 
 async fn upload_test_object(
-    executor: &Executor,
+    uploader: &Uploader<S3CrtClient>,
     bucket: &str,
     key: &str,
     size: u64,
     write_size: usize,
 ) -> Result<(), ObjectGenerationError> {
-    let mut request = executor
-        .uploader
+    let mut request = uploader
         .start_atomic_upload(bucket.to_string(), key.to_string())
         .map_err(|e| ObjectGenerationError::Upload {
             key: key.to_string(),
