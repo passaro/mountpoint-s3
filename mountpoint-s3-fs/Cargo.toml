@@ -18,9 +18,7 @@ mountpoint-s3-client = { workspace = true }
 # fast-moving crate is opt-in. The published 0.2.0 is the same tree as this rev.
 aws-sdk-s3-transfer-manager = { git = "https://github.com/awslabs/aws-s3-transfer-manager-rs.git", rev = "71aa144a", optional = true }
 
-# jemalloc for the `s3io_benchmark` example only, behind the `jemalloc` feature. The maintained tikv
-# fork rather than the unmaintained `jemallocator` the RTM's own example pins.
-tikv-jemallocator = { version = "0.7", optional = true }
+tikv-jemallocator = "0.7"
 
 anyhow = { version = "1.0.103", features = ["backtrace"] }
 async-channel = "2.5.0"
@@ -93,7 +91,6 @@ sha2 = "0.11.0"
 shuttle = { version = "0.9.1" }
 syscalls = { version = "0.8.1", default-features = false }
 test-case = "3.3.1"
-tikv-jemallocator = "0.7.0"
 tokio = { version = "1.52.3", features = ["rt", "macros", "rt-multi-thread", "sync"] }
 toml = "1.1.2"
 walkdir = "2.5.0"
@@ -105,10 +102,8 @@ block_size = []
 event_log = []
 # Experimental RTM-backed data plane (mountpoint-s3-fs::data). Example/test use only.
 rtm_data_plane = ["aws-sdk-s3-transfer-manager"]
-# Link jemalloc as the global allocator in the `s3io_benchmark` example, for measuring how much of
-# that example's resident memory is allocator behaviour rather than buffers actually in use. Affects
-# only the example: a `#[global_allocator]` in a library has no effect on anything that links it.
-jemalloc = ["tikv-jemallocator"]
+# Use alternative configuration for jemalloc.
+jemalloc_conf = []
 manifest = ["csv", "rusqlite"]
 
 # Features for choosing tests
