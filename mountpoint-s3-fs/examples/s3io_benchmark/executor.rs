@@ -252,6 +252,10 @@ fn build_rtm_plane(global: &GlobalConfig) -> Result<mountpoint_s3_fs::data::RtmD
     if let Some(bytes) = global.rtm_initial_request_size {
         config.initial_request_size = bytes;
     }
+    // The RTM writer cuts parts at its own `write_part_size`, independent of the read part size above.
+    if let Some(bytes) = global.write_part_size {
+        config.writer.write_part_size = bytes;
+    }
 
     // The transfer manager is built with an explicit `PartSize::Target` above, so the data plane can
     // divide the byte read-ahead ceiling by it exactly rather than assuming a default.

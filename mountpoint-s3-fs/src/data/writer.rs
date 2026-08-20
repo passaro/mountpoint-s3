@@ -29,19 +29,28 @@ use std::sync::Mutex;
 
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::operation::upload::UploadHandle;
-use aws_sdk_s3_transfer_manager::types::PartSize;
 use tracing::{debug, trace, warn};
 
 use crate::data::part_channel::{self, Closed, PartSink};
 use crate::data::priority::PriorityTable;
 use crate::data::{Urgency, WriteError, WriteOutcome, WriteSpec, Writer, WriterStats};
 
-/// RTM's default upload part size when the client is left on `PartSize::Auto`.
-const AUTO_UPLOAD_PART_SIZE: usize = 8 * 1024 * 1024;
+/// Default part size the sink cuts to when a caller does not set one.
+const DEFAULT_WRITE_PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// S3's minimum part size for every part but the last. A smaller `write_part_size` is raised to it.
+const MIN_WRITE_PART_SIZE: usize = 5 * 1024 * 1024;
 
 /// Tunables for the write path.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WriterConfig {
+    /// The size the sink cuts parts to, and therefore the S3 upload part size.
+    ///
+    /// The sink cuts parts itself and hands them to RTM as-is, so this — not the RTM client's part
+    /// size — is what lands on the wire. Read and write part sizes are independent as a result.
+    /// Raised to the 5 MiB S3 floor if smaller, since every part but the last must be at least that.
+    pub write_part_size: usize,
+
     /// Urgency-to-priority mapping, shared with the read path.
     ///
     /// An upload runs at [`Urgency::Demand`] throughout: nothing is ever uploaded
@@ -51,13 +60,12 @@ pub struct WriterConfig {
     pub priorities: PriorityTable,
 }
 
-/// The size the sink cuts parts to — RTM's own upload part size for this client, so pushed parts
-/// match what RTM expects. `Target` is already clamped to the 5 MiB S3 floor by RTM's config
-/// builder; `Auto` uploads use 8 MiB.
-fn upload_part_size(tm: &aws_sdk_s3_transfer_manager::Client) -> usize {
-    match tm.config().part_size() {
-        PartSize::Target(bytes) => *bytes as usize,
-        _ => AUTO_UPLOAD_PART_SIZE,
+impl Default for WriterConfig {
+    fn default() -> Self {
+        Self {
+            write_part_size: DEFAULT_WRITE_PART_SIZE,
+            priorities: PriorityTable::default(),
+        }
     }
 }
 
@@ -96,10 +104,12 @@ impl RtmWriter {
         spec: WriteSpec,
         config: &WriterConfig,
     ) -> Result<Self, WriteError> {
-        let (sink, source) = part_channel::channel(upload_part_size(tm));
+        let part_size = config.write_part_size.max(MIN_WRITE_PART_SIZE);
+        let (sink, source) = part_channel::channel(part_size);
         // No size hint is set on the source, so RTM reads it to end-of-stream rather than
-        // dispatching a part budget computed from a declared length. The source hands over one
-        // part at a time and blocks the writer until RTM takes it — see `part_channel`.
+        // dispatching a part budget computed from a declared length. The sink cuts parts at
+        // `part_size` — RTM uploads each as-is — and hands over one at a time, blocking the writer
+        // until RTM takes it. See `part_channel`.
 
         let handle = tm
             .upload()

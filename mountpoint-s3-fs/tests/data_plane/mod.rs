@@ -485,7 +485,7 @@ impl UploadFixture {
     }
 
     async fn build(
-        config: RtmConfig,
+        mut config: RtmConfig,
         part_size: Option<u64>,
         delay: Option<std::time::Duration>,
         fail_parts_with: Option<u16>,
@@ -503,12 +503,14 @@ impl UploadFixture {
             .mount(&server)
             .await;
 
-        let mut tm_config = aws_sdk_s3_transfer_manager::Config::builder().client(test_s3_client_for(&server));
+        // The writer cuts parts at `WriterConfig::write_part_size`, not the RTM client's part size,
+        // so that is what a test sets to control part boundaries. Anything below 5 MiB is raised to
+        // it, so tests that care about boundaries use multiples of 5 MiB.
         if let Some(part_size) = part_size {
-            // Anything below 5 MiB is silently raised to it, so tests that care about part
-            // boundaries must use multiples of 5 MiB.
-            tm_config = tm_config.part_size(PartSize::Target(part_size));
+            config.writer.write_part_size = part_size as usize;
         }
+
+        let mut tm_config = aws_sdk_s3_transfer_manager::Config::builder().client(test_s3_client_for(&server));
         if let Some(concurrency) = concurrency {
             tm_config = tm_config.concurrency(ConcurrencyMode::Explicit(concurrency));
         }

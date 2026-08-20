@@ -138,10 +138,11 @@ async fn every_streamed_upload_is_multipart_even_a_tiny_one() {
     );
 }
 
-/// A requested part size below 5 MiB is raised to it, silently — no error, no warning.
+/// A `write_part_size` below 5 MiB is raised to it, silently — no error, no warning.
 ///
-/// Pinned down because it means a caller cannot shrink upload parts to trade write amplification
-/// for latency.
+/// The sink cuts parts at `WriterConfig::write_part_size`, but S3 requires every part but the last
+/// to be at least 5 MiB, so the writer clamps a smaller request to that floor. Pinned down because
+/// it means a caller cannot shrink upload parts to trade write amplification for latency.
 #[tokio::test]
 async fn a_sub_5_mib_part_size_is_silently_raised_to_the_floor() {
     let requested = 64 * KIB as u64;
@@ -156,7 +157,7 @@ async fn a_sub_5_mib_part_size_is_silently_raised_to_the_floor() {
     assert_eq!(
         sizes,
         vec![PART as usize, PART as usize, 2 * MIB],
-        "requested {requested} byte parts; RTM used its 5 MiB floor"
+        "requested {requested} byte parts; the writer used its 5 MiB floor"
     );
     println!("upload part-size floor: requested {requested} bytes, got {sizes:?}");
 }
