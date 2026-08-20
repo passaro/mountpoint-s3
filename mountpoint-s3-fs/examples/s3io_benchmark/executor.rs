@@ -47,13 +47,15 @@ pub trait Executor: Send + Sync {
 
 /// The one implementation, generic over the read backend.
 ///
-/// Only the two read methods use `D`. The write path is the same for every backend — the data
-/// plane covers reads only, and both arms upload through `upload::Uploader` — which is why there
-/// is no writer counterpart to the read plane here.
+/// Reads always use `D`. Writes usually go through the CRT `upload::Uploader`, except the RTM arm,
+/// which writes through its own data-plane `Writer` (`read_plane.open_write`) — that is the path
+/// being measured against the CRT uploader. `writes_via_plane` selects which; it is `true` only for
+/// the RTM arm, since `PrefetchDataPlane::open_write` only errors.
 struct ExecutorImpl<D: DataPlane> {
     client: S3CrtClient,
     uploader: Uploader<S3CrtClient>,
     read_plane: D,
+    writes_via_plane: bool,
 }
 
 /// Build the configured data plane and an executor over it.
@@ -77,6 +79,8 @@ pub fn build_executor(global: &GlobalConfig) -> Result<Arc<dyn Executor>, Execut
                 client,
                 uploader,
                 read_plane: PrefetchDataPlane::new(prefetcher),
+                // The prefetcher arm is read-only; its writes go through the CRT uploader.
+                writes_via_plane: false,
             }))
         }
         #[cfg(feature = "rtm_data_plane")]
@@ -86,6 +90,8 @@ pub fn build_executor(global: &GlobalConfig) -> Result<Arc<dyn Executor>, Execut
                 client,
                 uploader,
                 read_plane,
+                // The RTM arm writes through its own data-plane Writer, the path under measurement.
+                writes_via_plane: true,
             }))
         }
         #[cfg(not(feature = "rtm_data_plane"))]
@@ -285,9 +291,114 @@ impl<D: DataPlane> ExecutorImpl<D> {
         }
 
         if config.incremental_upload {
+            // Append semantics, which the RTM write path cannot express: its upload builder exposes
+            // no write offset and no `if_match`. Erroring rather than silently falling back to the
+            // CRT uploader, which would mislabel the arm being measured.
+            if self.writes_via_plane {
+                return Err(ExecutionError::ExecutionFailed(
+                    "incremental_upload is not supported by the RTM data plane: its upload builder \
+                     has no write offset or if_match"
+                        .to_string(),
+                ));
+            }
             Ok(self.execute_incremental_upload(config).await)
+        } else if self.writes_via_plane {
+            Ok(self.execute_plane_upload(config).await)
         } else {
             Ok(self.execute_multipart_upload(config).await)
+        }
+    }
+
+    /// One upload per iteration through the data plane's own write path (the RTM arm).
+    ///
+    /// The writer declares no size — a filesystem does not know it up front — so RTM streams to
+    /// end-of-stream. Reads `writer.stats()` before the terminal call (both `complete` and `abort`
+    /// consume the writer), and aborts explicitly on a failed write, since dropping would leave a
+    /// partial MPU on S3.
+    async fn execute_plane_upload(&self, config: &ResolvedJobConfig) -> JobResult {
+        use crate::results::WriteStats;
+        use mountpoint_s3_fs::data::{WriteSpec, Writer};
+
+        let mut total_bytes = 0u64;
+        let mut errors = Vec::new();
+        let mut iterations_completed = 0usize;
+        let mut write_stats = WriteStats::default();
+
+        let job_start = Instant::now();
+        let contents = vec![0xab; config.write_size];
+        let target_size = config.object_size;
+
+        for _iteration in 0..config.iterations {
+            if let Some(max_dur) = config.max_duration
+                && job_start.elapsed() >= max_dur
+            {
+                break;
+            }
+
+            let spec = WriteSpec::new(config.bucket.clone(), config.object_key.clone());
+            let mut writer = match self.read_plane.open_write(spec) {
+                Ok(writer) => writer,
+                Err(e) => {
+                    errors.push(ErrorInfo {
+                        error_type: "OpenWriteError".to_string(),
+                        message: format!("open_write failed: {e}"),
+                    });
+                    continue;
+                }
+            };
+
+            let mut offset = 0u64;
+            let mut failed = None;
+            while offset < target_size {
+                let len = (contents.len() as u64).min(target_size - offset) as usize;
+                if let Err(e) = writer.write_at(offset, &contents[..len]).await {
+                    failed = Some(ErrorInfo {
+                        error_type: "WriteError".to_string(),
+                        message: format!("write_at {offset} failed: {e}"),
+                    });
+                    break;
+                }
+                offset += len as u64;
+            }
+
+            // Read the counters before a terminal call consumes the writer.
+            let stats = writer.stats();
+            write_stats.bytes_accepted += stats.bytes_accepted;
+            write_stats.write_stalls += stats.write_stalls;
+
+            if let Some(error) = failed {
+                if let Err(e) = writer.abort().await {
+                    errors.push(ErrorInfo {
+                        error_type: "AbortError".to_string(),
+                        message: format!("abort after a failed write also failed: {e}"),
+                    });
+                }
+                errors.push(error);
+                continue;
+            }
+
+            match writer.complete().await {
+                Ok(outcome) => {
+                    write_stats.multipart_uploads += u64::from(outcome.multipart);
+                    total_bytes += outcome.size;
+                    iterations_completed += 1;
+                }
+                Err(e) => errors.push(ErrorInfo {
+                    error_type: "CompleteError".to_string(),
+                    message: format!("complete failed: {e}"),
+                }),
+            }
+        }
+
+        JobResult {
+            job_name: config.name.clone(),
+            workload_type: "write".to_string(),
+            iterations_completed,
+            total_bytes,
+            elapsed_seconds: job_start.elapsed(),
+            errors,
+            read_stats: None,
+            write_stats: Some(write_stats),
         }
     }
 
@@ -367,6 +478,7 @@ impl<D: DataPlane> ExecutorImpl<D> {
             elapsed_seconds: duration,
             errors,
             read_stats: Some(read_stats),
+            write_stats: None,
         })
     }
 
@@ -480,6 +592,7 @@ impl<D: DataPlane> ExecutorImpl<D> {
             elapsed_seconds: duration,
             errors,
             read_stats: Some(read_stats),
+            write_stats: None,
         })
     }
 
@@ -575,6 +688,7 @@ impl<D: DataPlane> ExecutorImpl<D> {
             elapsed_seconds: duration,
             errors,
             read_stats: None,
+            write_stats: None,
         }
     }
 
@@ -665,6 +779,7 @@ impl<D: DataPlane> ExecutorImpl<D> {
             elapsed_seconds: duration,
             errors,
             read_stats: None,
+            write_stats: None,
         }
     }
 }

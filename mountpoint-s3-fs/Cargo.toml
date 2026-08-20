@@ -15,8 +15,9 @@ mountpoint-s3-client = { workspace = true }
 # mountpoint-s3 binary does not enable the feature, so it stays out of release builds.
 #
 # Pinned to an exact upstream commit rather than a crates.io version, so upstream churn in a
-# fast-moving crate is opt-in. The published 0.2.0 is the same tree as this rev.
-aws-sdk-s3-transfer-manager = { git = "https://github.com/awslabs/aws-s3-transfer-manager-rs.git", rev = "71aa144a", optional = true }
+# fast-moving crate is opt-in. This rev is `main` at f4c8f46, which adds unknown-length streaming
+# uploads (PR #164) — the write path relies on it. Swap for a release tag once one lands past #164.
+aws-sdk-s3-transfer-manager = { git = "https://github.com/awslabs/aws-s3-transfer-manager-rs.git", rev = "f4c8f46", optional = true }
 
 tikv-jemallocator = "0.7"
 
@@ -126,6 +127,10 @@ required-features = ["rtm_data_plane"]
 
 [[test]]
 name = "data_plane_priority"
+required-features = ["rtm_data_plane"]
+
+[[test]]
+name = "data_plane_write"
 required-features = ["rtm_data_plane"]
 
 [[example]]

@@ -18,7 +18,10 @@ use mountpoint_s3_client::ObjectClient;
 
 use crate::sync::AsyncMutex;
 
-use crate::data::{DataPlane, ObjectSpec, ReadError, Reader, ReaderStats, Segments};
+use crate::data::{
+    DataPlane, ObjectSpec, ReadError, Reader, ReaderStats, Segments, WriteError, WriteOutcome, WriteSpec, Writer,
+    WriterStats,
+};
 use crate::prefetch::{PrefetchGetObject, Prefetcher};
 
 /// [`DataPlane`] over the existing [`Prefetcher`].
@@ -44,6 +47,17 @@ where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
     type Reader = PrefetchReader<Client>;
+    type Writer = UnsupportedWriter;
+
+    /// Always fails: this backend covers reads only.
+    ///
+    /// The CRT write path is [`crate::upload`], which wraps a `PutObjectRequest` rather than a
+    /// transfer, so it does not fit these traits without a separate adapter. Erroring rather
+    /// than omitting the method keeps the trait describing both directions while making clear
+    /// this implementation covers one.
+    fn open_write(&self, _spec: WriteSpec) -> Result<Self::Writer, WriteError> {
+        Err(WriteError::Transfer(Box::new(WriteNotImplemented)))
+    }
 
     fn open_read(&self, obj: ObjectSpec) -> Self::Reader {
         let request = self
@@ -129,3 +143,44 @@ where
         *self.stats.lock().expect("stats lock poisoned")
     }
 }
+
+/// Inhabits [`DataPlane::Writer`] for a read-only backend.
+///
+/// Uninhabited, so every method below is unreachable and the compiler agrees: there is no way
+/// to construct one, because [`PrefetchDataPlane::open_write`] only ever returns an error.
+#[derive(Debug)]
+pub enum UnsupportedWriter {}
+
+impl Writer for UnsupportedWriter {
+    async fn write_at(&mut self, _offset: u64, _data: &[u8]) -> Result<usize, WriteError> {
+        match *self {}
+    }
+
+    async fn complete(self) -> Result<WriteOutcome, WriteError> {
+        match self {}
+    }
+
+    async fn abort(self) -> Result<(), WriteError> {
+        match self {}
+    }
+
+    fn stats(&self) -> WriterStats {
+        match *self {}
+    }
+}
+
+/// Why the comparison arm has no write path.
+#[derive(Debug)]
+struct WriteNotImplemented;
+
+impl std::fmt::Display for WriteNotImplemented {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the prefetcher comparison arm implements the read path only; \
+             use mountpoint_s3_fs::upload for CRT-backed uploads"
+        )
+    }
+}
+
+impl std::error::Error for WriteNotImplemented {}

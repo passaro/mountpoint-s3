@@ -427,7 +427,7 @@ dependencies = [
 [[package]]
 name = "aws-sdk-s3-transfer-manager"
 version = "0.2.0"
-source = "git+https://github.com/awslabs/aws-s3-transfer-manager-rs.git?rev=71aa144a#71aa144af2b3224a48628ef4e0a69357a05c718e"
+source = "git+https://github.com/awslabs/aws-s3-transfer-manager-rs.git?rev=f4c8f46#f4c8f46740b376fbb087ed67568fcf0e7d1f0667"
 dependencies = [
  "aws-config",
  "aws-runtime",

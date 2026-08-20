@@ -1,10 +1,12 @@
-//! Reading object data, independent of which transfer layer moves the bytes.
+//! Reading and writing object data, independent of which transfer layer moves the bytes.
 //!
 //! Two implementations sit behind [`DataPlane`]:
 //!
 //! - [`prefetch_adapter`] wraps the existing [`Prefetcher`](crate::prefetch::Prefetcher),
-//!   so the CRT-backed path is reachable through these traits.
-//! - [`reader`] drives the AWS S3 Transfer Manager for Rust (RTM).
+//!   so the CRT-backed read path is reachable through these traits. It is read-only; its
+//!   [`open_write`](DataPlane::open_write) always errors.
+//! - [`reader`] and [`writer`] drive the AWS S3 Transfer Manager for Rust (RTM), for downloads
+//!   and uploads respectively.
 //!
 //! One trait over both lets a single benchmark binary run the same workload against either
 //! backend and compare the results.
@@ -19,9 +21,13 @@ pub mod segments;
 #[cfg(feature = "rtm_data_plane")]
 pub mod cursor;
 #[cfg(feature = "rtm_data_plane")]
+pub mod part_channel;
+#[cfg(feature = "rtm_data_plane")]
 pub mod priority;
 #[cfg(feature = "rtm_data_plane")]
 pub mod reader;
+#[cfg(feature = "rtm_data_plane")]
+pub mod writer;
 
 pub mod prefetch_adapter;
 
@@ -33,6 +39,8 @@ pub use segments::Segments;
 pub use priority::PriorityTable;
 #[cfg(feature = "rtm_data_plane")]
 pub use reader::{RtmConfig, RtmDataPlane, RtmReader};
+#[cfg(feature = "rtm_data_plane")]
+pub use writer::{RtmWriter, WriteResult, WriterConfig};
 
 pub use prefetch_adapter::PrefetchDataPlane;
 
@@ -98,6 +106,27 @@ pub enum ReadError {
     UnexpectedEof { offset: u64, short_by: u64 },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum WriteError {
+    /// A write arrived somewhere other than the current end of the stream.
+    ///
+    /// Uploads are append-only: a multipart part cannot be revised once sent, so there is no
+    /// way to honour a write behind the current position.
+    #[error("out-of-order write at offset {write_offset}, expected {expected_offset}")]
+    OutOfOrderWrite { write_offset: u64, expected_offset: u64 },
+
+    /// The transfer layer failed. Boxed for the same reason as [`ReadError::Transfer`].
+    ///
+    /// An unknown-length upload that overruns the multipart ceiling (`part_size * 10,000`)
+    /// surfaces here, mid-stream, since without a declared size it cannot be caught up front.
+    #[error("transfer failed: {0}")]
+    Transfer(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// The upload was already finished — completed or aborted — when this call arrived.
+    #[error("upload is no longer in progress")]
+    NotInProgress,
+}
+
 /// Per-reader counters, for diagnostics and for comparing backends: request and cursor
 /// counts are what make read amplification and cursor thrash visible.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -117,9 +146,57 @@ pub struct ReaderStats {
     pub cursors_opened: u64,
 }
 
-/// Opens readers over objects.
+/// Per-writer counters, the upload counterpart of [`ReaderStats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriterStats {
+    /// Bytes accepted from the caller by [`Writer::write_at`].
+    pub bytes_accepted: u64,
+    /// Bytes handed to the transfer layer.
+    ///
+    /// Trails `bytes_accepted` by whatever is still buffered; equal once
+    /// [`complete`](Writer::complete) returns.
+    pub bytes_dispatched: u64,
+    /// Times `write_at` had to wait for buffer space, i.e. the caller was throttled to the
+    /// network's rate rather than buffering without limit.
+    pub write_stalls: u64,
+}
+
+/// Identifies an object being created.
+///
+/// Not [`ObjectSpec`]: there is no etag yet — that is the upload's *result* — and the size is
+/// not known in advance. A filesystem writer never knows the final object size when it opens
+/// the file, so the upload streams to end-of-stream with no declared bound (see
+/// [`writer`](crate::data::writer)).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WriteSpec {
+    pub bucket: String,
+    pub key: String,
+}
+
+impl WriteSpec {
+    pub fn new(bucket: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            key: key.into(),
+        }
+    }
+}
+
+/// What an upload produced.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WriteOutcome {
+    /// The finished object's etag, if the transfer layer reported one.
+    pub etag: Option<String>,
+    /// Bytes uploaded.
+    pub size: u64,
+    /// Whether this went out as a multipart upload rather than a single PUT.
+    pub multipart: bool,
+}
+
+/// Opens readers and writers over objects.
 pub trait DataPlane: Send + Sync {
     type Reader: Reader;
+    type Writer: Writer;
 
     /// Open a reader.
     ///
@@ -129,6 +206,13 @@ pub trait DataPlane: Send + Sync {
     ///
     /// [`Prefetcher::prefetch`]: crate::prefetch::Prefetcher::prefetch
     fn open_read(&self, obj: ObjectSpec) -> Self::Reader;
+
+    /// Open a writer, starting the upload.
+    ///
+    /// Fallible and eager where [`open_read`](Self::open_read) is infallible and lazy: an
+    /// upload is a single transfer covering the whole object, so it has to begin here rather
+    /// than on first write.
+    fn open_write(&self, spec: WriteSpec) -> Result<Self::Writer, WriteError>;
 }
 
 /// Reads bytes of one object.
@@ -150,4 +234,35 @@ pub trait Reader: Send + Sync {
     fn read_at(&self, offset: u64, len: usize) -> impl Future<Output = Result<Segments, ReadError>> + Send;
 
     fn stats(&self) -> ReaderStats;
+}
+
+/// Writes the bytes of one object.
+///
+/// `write_at` takes `&mut self` where [`Reader::read_at`] takes `&self`. Uploads are
+/// append-only — parts are numbered in order and a sent part cannot be revised — so there is
+/// exactly one write position and it is implicit state. The `offset` argument exists only to
+/// check the caller against that position, reported as [`WriteError::OutOfOrderWrite`].
+///
+/// **[`abort`](Self::abort) must be called explicitly to cancel; `Drop` is not a substitute.**
+/// Dropping a writer cancels the transfer without issuing `AbortMultipartUpload`, leaving a
+/// partial multipart upload on S3 for a lifecycle rule to clean up. `Drop` cannot fix this
+/// because issuing that call is async. Both terminal methods take `self`, so a writer cannot
+/// be used after either.
+pub trait Writer: Send {
+    /// Append `data` at `offset`, which must equal the current end of the stream.
+    ///
+    /// Returns the number of bytes accepted, always `data.len()` on success — a short write is
+    /// not a success.
+    ///
+    /// Waits when the internal buffer is full. That wait is the backpressure that keeps
+    /// buffered bytes bounded when a caller writes faster than the network drains.
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> impl Future<Output = Result<usize, WriteError>> + Send;
+
+    /// Flush anything buffered, finish the transfer, and report what was uploaded.
+    fn complete(self) -> impl Future<Output = Result<WriteOutcome, WriteError>> + Send;
+
+    /// Cancel the upload, issuing `AbortMultipartUpload` if a multipart upload was started.
+    fn abort(self) -> impl Future<Output = Result<(), WriteError>> + Send;
+
+    fn stats(&self) -> WriterStats;
 }

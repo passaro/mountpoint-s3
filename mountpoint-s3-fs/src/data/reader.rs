@@ -39,7 +39,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::data::cursor::{Cursor, CursorId};
-use crate::data::{DataPlane, ObjectSpec, ReadError, Reader, ReaderStats, Segments, Urgency};
+use crate::data::writer::{RtmWriter, WriterConfig};
+use crate::data::{DataPlane, ObjectSpec, ReadError, Reader, ReaderStats, Segments, Urgency, WriteError, WriteSpec};
 
 use crate::sync::AsyncMutex;
 use tracing::{debug, trace, warn};
@@ -105,6 +106,9 @@ pub struct RtmConfig {
 
     /// Urgency-to-priority mapping.
     pub priorities: PriorityTable,
+
+    /// Tunables for the upload path used by [`DataPlane::open_write`].
+    pub writer: WriterConfig,
 }
 
 impl Default for RtmConfig {
@@ -120,6 +124,7 @@ impl Default for RtmConfig {
             initial_request_size: crate::prefetch::INITIAL_REQUEST_SIZE as u64,
             initial_request_trigger_divisor: 2,
             priorities: PriorityTable::default(),
+            writer: WriterConfig::default(),
         }
     }
 }
@@ -216,6 +221,11 @@ fn read_ahead_parts_for(max_bytes: usize, part_size: u64) -> usize {
 
 impl DataPlane for RtmDataPlane {
     type Reader = RtmReader;
+    type Writer = RtmWriter;
+
+    fn open_write(&self, spec: WriteSpec) -> Result<RtmWriter, WriteError> {
+        RtmWriter::open(&self.tm, spec, &self.config.writer)
+    }
 
     fn open_read(&self, obj: ObjectSpec) -> RtmReader {
         RtmReader {

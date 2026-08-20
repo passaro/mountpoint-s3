@@ -33,6 +33,11 @@ pub struct JobResult {
     /// `mountpoint_s3_fs::data::prefetch_adapter`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_stats: Option<ReadStats>,
+    /// Write-path counters. `None` for read jobs, and for write jobs on the CRT `Uploader`, which
+    /// exposes no equivalent — so this is populated only on the RTM write arm, which drives a
+    /// `mountpoint_s3_fs::data::Writer`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_stats: Option<WriteStats>,
 }
 
 /// Read-path counters as reported by a `mountpoint_s3_fs::data::Reader`, plus what the
@@ -62,6 +67,20 @@ pub struct ReadStats {
     pub chunks_returned: u64,
     /// `read_at` calls, as the denominator for `chunks_returned`.
     pub reads_completed: u64,
+}
+
+/// Write-path counters as reported by a `mountpoint_s3_fs::data::Writer`.
+///
+/// `write_stalls` is the one to watch: it counts how often the writer had to wait for RTM to take a
+/// full part, so a non-zero value means the writer was genuinely throttled to the network's rate
+/// rather than buffering without limit (the write path holds at most one part).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WriteStats {
+    pub bytes_accepted: u64,
+    pub write_stalls: u64,
+    /// Uploads that went out as MPUs. Always equal to the iteration count on the RTM arm — a
+    /// caller-supplied `PartStream` is MPU-only, whatever the object's size.
+    pub multipart_uploads: u64,
 }
 
 impl ReadStats {
