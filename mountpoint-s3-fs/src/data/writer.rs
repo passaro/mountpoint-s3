@@ -98,12 +98,16 @@ impl RtmWriter {
     /// Initiate an upload.
     ///
     /// The upload streams to end-of-stream with no declared size — see the module docs. Fails
-    /// only if the transfer layer rejects the initiate call.
+    /// only if the transfer layer rejects the initiate call, or if an incremental upload is
+    /// requested (RTM's streaming MPU has no write offset or `if_match`).
     pub fn open(
         tm: &aws_sdk_s3_transfer_manager::Client,
         spec: WriteSpec,
         config: &WriterConfig,
     ) -> Result<Self, WriteError> {
+        if spec.incremental {
+            return Err(WriteError::IncrementalUnsupported);
+        }
         let part_size = config.write_part_size.max(MIN_WRITE_PART_SIZE);
         let (sink, source) = part_channel::channel(part_size);
         // No size hint is set on the source, so RTM reads it to end-of-stream rather than

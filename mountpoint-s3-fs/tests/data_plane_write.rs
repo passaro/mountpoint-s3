@@ -15,7 +15,7 @@ mod data_plane;
 use std::time::Duration;
 
 use data_plane::{UploadFixture, expected_bytes};
-use mountpoint_s3_fs::data::{DataPlane, RtmConfig, WriteError, Writer};
+use mountpoint_s3_fs::data::{DataPlane, RtmConfig, WriteError, WriteSpec, Writer};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -267,6 +267,25 @@ async fn out_of_order_write_is_rejected_and_leaves_the_stream_usable() {
     let outcome = writer.complete().await.expect("complete");
     assert_eq!(outcome.size, 16 * KIB as u64);
     assert_eq!(fx.log().assembled(), expected_bytes(0, 16 * KIB));
+}
+
+/// The RTM writer streams a single multipart upload with no write offset or `if_match`, so it
+/// cannot express an append. An incremental `WriteSpec` is rejected up front, before anything is
+/// sent — the CRT arm covers append instead.
+#[tokio::test]
+async fn rtm_rejects_incremental_upload() {
+    let fx = UploadFixture::new(RtmConfig::default()).await;
+
+    let err = fx
+        .plane
+        .open_write(WriteSpec::incremental("test-bucket", "object"))
+        .err()
+        .expect("RTM must reject an incremental upload");
+    assert!(matches!(err, WriteError::IncrementalUnsupported), "got {err:?}");
+
+    let log = fx.log();
+    assert_eq!(log.creates, 0, "nothing should reach the wire");
+    assert_eq!(log.puts.len(), 0);
 }
 
 #[tokio::test]

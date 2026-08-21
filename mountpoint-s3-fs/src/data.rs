@@ -2,9 +2,9 @@
 //!
 //! Two implementations sit behind [`DataPlane`]:
 //!
-//! - [`prefetch_adapter`] wraps the existing [`Prefetcher`](crate::prefetch::Prefetcher),
-//!   so the CRT-backed read path is reachable through these traits. It is read-only; its
-//!   [`open_write`](DataPlane::open_write) always errors.
+//! - [`crt_adapter`] wraps the existing CRT [`Prefetcher`](crate::prefetch::Prefetcher) and
+//!   [`Uploader`](crate::upload::Uploader), so the CRT-backed read and write paths are reachable
+//!   through these traits.
 //! - [`reader`] and [`writer`] drive the AWS S3 Transfer Manager for Rust (RTM), for downloads
 //!   and uploads respectively.
 //!
@@ -29,7 +29,7 @@ pub mod reader;
 #[cfg(feature = "rtm_data_plane")]
 pub mod writer;
 
-pub mod prefetch_adapter;
+pub mod crt_adapter;
 
 use std::future::Future;
 
@@ -42,7 +42,7 @@ pub use reader::{RtmConfig, RtmDataPlane, RtmReader};
 #[cfg(feature = "rtm_data_plane")]
 pub use writer::{RtmWriter, WriteResult, WriterConfig};
 
-pub use prefetch_adapter::PrefetchDataPlane;
+pub use crt_adapter::CrtDataPlane;
 
 use crate::{object::ObjectId, s3::Bucket};
 
@@ -125,6 +125,13 @@ pub enum WriteError {
     /// The upload was already finished — completed or aborted — when this call arrived.
     #[error("upload is no longer in progress")]
     NotInProgress,
+
+    /// An incremental (append) upload was requested of a backend that cannot express it.
+    ///
+    /// The RTM writer streams a single multipart upload with no write offset or `if_match`, so it
+    /// has no way to append to an existing object.
+    #[error("incremental/append upload is not supported by this backend")]
+    IncrementalUnsupported,
 }
 
 /// Per-reader counters, for diagnostics and for comparing backends: request and cursor
@@ -171,13 +178,27 @@ pub struct WriterStats {
 pub struct WriteSpec {
     pub bucket: String,
     pub key: String,
+    /// Append to an existing object rather than replacing it. Only some backends support this —
+    /// [`DataPlane::open_write`] returns [`WriteError::IncrementalUnsupported`] on those that do not.
+    pub incremental: bool,
 }
 
 impl WriteSpec {
+    /// A whole-object (atomic) write.
     pub fn new(bucket: impl Into<String>, key: impl Into<String>) -> Self {
         Self {
             bucket: bucket.into(),
             key: key.into(),
+            incremental: false,
+        }
+    }
+
+    /// An incremental (append) write. Not every backend supports it (see [`WriteSpec::incremental`]).
+    pub fn incremental(bucket: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            key: key.into(),
+            incremental: true,
         }
     }
 }

@@ -7,10 +7,9 @@ use async_trait::async_trait;
 use mountpoint_s3_client::config::{Allocator, EndpointConfig, S3ClientConfig, Uri};
 use mountpoint_s3_client::types::HeadObjectParams;
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
-use mountpoint_s3_fs::data::{DataPlane, ObjectSpec, PrefetchDataPlane, Reader};
+use mountpoint_s3_fs::data::{CrtDataPlane, DataPlane, ObjectSpec, Reader, WriteError, WriteSpec, Writer};
 use mountpoint_s3_fs::memory::effective_total_memory;
 use mountpoint_s3_fs::memory::{CandidateSize, PagedPool};
-use mountpoint_s3_fs::object::ObjectId;
 use mountpoint_s3_fs::prefetch::{Prefetcher, PrefetcherConfig};
 use mountpoint_s3_fs::upload::{Uploader, UploaderConfig};
 use mountpoint_s3_fs::{Runtime, ServerSideEncryption};
@@ -45,17 +44,94 @@ pub trait Executor: Send + Sync {
     async fn execute_write_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError>;
 }
 
-/// The one implementation, generic over the read backend.
+/// Object metadata lookup, kept out of the crate's `DataPlane` trait.
 ///
-/// Reads always use `D`. Writes usually go through the CRT `upload::Uploader`, except the RTM arm,
-/// which writes through its own data-plane `Writer` (`read_plane.open_write`) — that is the path
-/// being measured against the CRT uploader. `writes_via_plane` selects which; it is `true` only for
-/// the RTM arm, since `PrefetchDataPlane::open_write` only errors.
-struct ExecutorImpl<D: DataPlane> {
-    client: S3CrtClient,
-    uploader: Uploader<S3CrtClient>,
-    read_plane: D,
-    writes_via_plane: bool,
+/// The read path needs an object's etag+size before `open_read`. Rather than put a HEAD on the
+/// crate trait, this benchmark-local extension trait provides it, implemented per backend through
+/// the client that backend already carries (`S3CrtClient` for the CRT arm, the SDK `aws_sdk_s3`
+/// client for the RTM arm).
+#[async_trait]
+trait Head {
+    async fn head(&self, bucket: &str, key: &str) -> Result<ObjectSpec, ExecutionError>;
+}
+
+/// The one implementation. Reads and writes both go through the data plane `D`; there is no
+/// separate client or uploader here — each is owned by the plane (or its `Head` client).
+struct ExecutorImpl<D: DataPlane + Head> {
+    plane: D,
+}
+
+/// The CRT plane plus the `S3CrtClient` used for HEAD, so the whole read+write+metadata surface is
+/// one value the executor holds.
+struct CrtBenchPlane {
+    inner: CrtDataPlane<S3CrtClient>,
+    head: S3CrtClient,
+}
+
+impl DataPlane for CrtBenchPlane {
+    type Reader = <CrtDataPlane<S3CrtClient> as DataPlane>::Reader;
+    type Writer = <CrtDataPlane<S3CrtClient> as DataPlane>::Writer;
+
+    fn open_read(&self, obj: ObjectSpec) -> Self::Reader {
+        self.inner.open_read(obj)
+    }
+
+    fn open_write(&self, spec: WriteSpec) -> Result<Self::Writer, WriteError> {
+        self.inner.open_write(spec)
+    }
+}
+
+#[async_trait]
+impl Head for CrtBenchPlane {
+    async fn head(&self, bucket: &str, key: &str) -> Result<ObjectSpec, ExecutionError> {
+        let result = self
+            .head
+            .head_object(bucket, key, &HeadObjectParams::new())
+            .await
+            .map_err(|e| ExecutionError::S3Error(format!("HeadObject failed: {}", e)))?;
+        Ok(ObjectSpec::new(bucket, key, result.etag.as_str(), result.size))
+    }
+}
+
+/// The RTM plane plus the SDK `aws_sdk_s3` client used for HEAD.
+#[cfg(feature = "rtm_data_plane")]
+struct RtmBenchPlane {
+    inner: mountpoint_s3_fs::data::RtmDataPlane,
+    head: aws_sdk_s3::Client,
+}
+
+#[cfg(feature = "rtm_data_plane")]
+impl DataPlane for RtmBenchPlane {
+    type Reader = <mountpoint_s3_fs::data::RtmDataPlane as DataPlane>::Reader;
+    type Writer = <mountpoint_s3_fs::data::RtmDataPlane as DataPlane>::Writer;
+
+    fn open_read(&self, obj: ObjectSpec) -> Self::Reader {
+        self.inner.open_read(obj)
+    }
+
+    fn open_write(&self, spec: WriteSpec) -> Result<Self::Writer, WriteError> {
+        self.inner.open_write(spec)
+    }
+}
+
+#[cfg(feature = "rtm_data_plane")]
+#[async_trait]
+impl Head for RtmBenchPlane {
+    async fn head(&self, bucket: &str, key: &str) -> Result<ObjectSpec, ExecutionError> {
+        let output = self
+            .head
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| ExecutionError::S3Error(format!("HeadObject failed: {}", e)))?;
+        let etag = output
+            .e_tag()
+            .ok_or_else(|| ExecutionError::S3Error("HeadObject returned no ETag".to_string()))?;
+        let size = output.content_length().unwrap_or(0) as u64;
+        Ok(ObjectSpec::new(bucket, key, etag, size))
+    }
 }
 
 /// Build the configured data plane and an executor over it.
@@ -64,36 +140,26 @@ struct ExecutorImpl<D: DataPlane> {
 /// and erases it immediately, which is what keeps the type parameter inside this module — a
 /// `match` cannot return two types, but each arm can produce its own trait object.
 pub fn build_executor(global: &GlobalConfig) -> Result<Arc<dyn Executor>, ExecutionError> {
-    let S3Resources {
-        client,
-        uploader,
-        runtime,
-        pool,
-    } = build_s3(global)?;
-
     match global.data_plane {
         DataPlaneKind::Prefetcher => {
+            let S3Resources {
+                client,
+                uploader,
+                runtime,
+                pool,
+            } = build_s3(global)?;
             let prefetcher =
                 Prefetcher::default_builder(client.clone()).build(runtime, pool, PrefetcherConfig::default());
-            Ok(Arc::new(ExecutorImpl {
-                client,
-                uploader,
-                read_plane: PrefetchDataPlane::new(prefetcher),
-                // The prefetcher arm is read-only; its writes go through the CRT uploader.
-                writes_via_plane: false,
-            }))
+            let plane = CrtBenchPlane {
+                inner: CrtDataPlane::new(prefetcher, uploader),
+                head: client,
+            };
+            Ok(Arc::new(ExecutorImpl { plane }))
         }
         #[cfg(feature = "rtm_data_plane")]
-        DataPlaneKind::Rtm => {
-            let read_plane = build_rtm_plane(global)?;
-            Ok(Arc::new(ExecutorImpl {
-                client,
-                uploader,
-                read_plane,
-                // The RTM arm writes through its own data-plane Writer, the path under measurement.
-                writes_via_plane: true,
-            }))
-        }
+        DataPlaneKind::Rtm => Ok(Arc::new(ExecutorImpl {
+            plane: build_rtm_plane(global)?,
+        })),
         #[cfg(not(feature = "rtm_data_plane"))]
         DataPlaneKind::Rtm => Err(ExecutionError::ResourceInitError(
             crate::config::RTM_ERROR_STRING.to_string(),
@@ -214,7 +280,7 @@ fn build_s3(global: &GlobalConfig) -> Result<S3Resources, ExecutionError> {
 /// a run, with separate connection pools and TLS stacks. That is inherent to running the
 /// two data planes in one binary, and worth remembering when reading memory figures.
 #[cfg(feature = "rtm_data_plane")]
-fn build_rtm_plane(global: &GlobalConfig) -> Result<mountpoint_s3_fs::data::RtmDataPlane, ExecutionError> {
+fn build_rtm_plane(global: &GlobalConfig) -> Result<RtmBenchPlane, ExecutionError> {
     use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, TargetThroughput};
     use mountpoint_s3_fs::data::{RtmConfig, RtmDataPlane};
 
@@ -231,6 +297,8 @@ fn build_rtm_plane(global: &GlobalConfig) -> Result<mountpoint_s3_fs::data::RtmD
         loader.load().await
     });
     let s3 = aws_sdk_s3::Client::new(&sdk_config);
+    // Keep a clone for HEAD (the transfer manager does not expose its inner client).
+    let head_client = s3.clone();
 
     let mut tm_builder = aws_sdk_s3_transfer_manager::Config::builder()
         .client(s3)
@@ -259,11 +327,14 @@ fn build_rtm_plane(global: &GlobalConfig) -> Result<mountpoint_s3_fs::data::RtmD
 
     // The transfer manager is built with an explicit `PartSize::Target` above, so the data plane can
     // divide the byte read-ahead ceiling by it exactly rather than assuming a default.
-    Ok(RtmDataPlane::new(tm, config))
+    Ok(RtmBenchPlane {
+        inner: RtmDataPlane::new(tm, config),
+        head: head_client,
+    })
 }
 
 #[async_trait]
-impl<D: DataPlane + 'static> Executor for ExecutorImpl<D> {
+impl<D: DataPlane + Head + 'static> Executor for ExecutorImpl<D> {
     async fn execute_read_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
         self.execute_read_job(config).await
     }
@@ -273,7 +344,7 @@ impl<D: DataPlane + 'static> Executor for ExecutorImpl<D> {
     }
 }
 
-impl<D: DataPlane> ExecutorImpl<D> {
+impl<D: DataPlane + Head> ExecutorImpl<D> {
     async fn execute_read_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
         if config.workload_type != WorkloadType::Read {
             return Err(ExecutionError::ExecutionFailed(
@@ -287,6 +358,14 @@ impl<D: DataPlane> ExecutorImpl<D> {
         }
     }
 
+    /// Run a write job through the data plane's `Writer`, whatever backend it is.
+    ///
+    /// One upload per iteration. The writer declares no size — a filesystem does not know it up
+    /// front. `incremental_upload` selects an append (`WriteSpec::incremental`) vs a whole-object
+    /// write; a backend that cannot append (the RTM writer) surfaces
+    /// `WriteError::IncrementalUnsupported` from `open_write`, recorded as a job error. Reads
+    /// `writer.stats()` before the terminal call (both `complete` and `abort` consume the writer),
+    /// and aborts explicitly on a failed write.
     async fn execute_write_job(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
         if config.workload_type != WorkloadType::Write {
             return Err(ExecutionError::ExecutionFailed(
@@ -294,34 +373,7 @@ impl<D: DataPlane> ExecutorImpl<D> {
             ));
         }
 
-        if config.incremental_upload {
-            // Append semantics, which the RTM write path cannot express: its upload builder exposes
-            // no write offset and no `if_match`. Erroring rather than silently falling back to the
-            // CRT uploader, which would mislabel the arm being measured.
-            if self.writes_via_plane {
-                return Err(ExecutionError::ExecutionFailed(
-                    "incremental_upload is not supported by the RTM data plane: its upload builder \
-                     has no write offset or if_match"
-                        .to_string(),
-                ));
-            }
-            Ok(self.execute_incremental_upload(config).await)
-        } else if self.writes_via_plane {
-            Ok(self.execute_plane_upload(config).await)
-        } else {
-            Ok(self.execute_multipart_upload(config).await)
-        }
-    }
-
-    /// One upload per iteration through the data plane's own write path (the RTM arm).
-    ///
-    /// The writer declares no size — a filesystem does not know it up front — so RTM streams to
-    /// end-of-stream. Reads `writer.stats()` before the terminal call (both `complete` and `abort`
-    /// consume the writer), and aborts explicitly on a failed write, since dropping would leave a
-    /// partial MPU on S3.
-    async fn execute_plane_upload(&self, config: &ResolvedJobConfig) -> JobResult {
         use crate::results::WriteStats;
-        use mountpoint_s3_fs::data::{WriteSpec, Writer};
 
         let mut total_bytes = 0u64;
         let mut errors = Vec::new();
@@ -339,8 +391,12 @@ impl<D: DataPlane> ExecutorImpl<D> {
                 break;
             }
 
-            let spec = WriteSpec::new(config.bucket.clone(), config.object_key.clone());
-            let mut writer = match self.read_plane.open_write(spec) {
+            let spec = if config.incremental_upload {
+                WriteSpec::incremental(config.bucket.clone(), config.object_key.clone())
+            } else {
+                WriteSpec::new(config.bucket.clone(), config.object_key.clone())
+            };
+            let mut writer = match self.plane.open_write(spec) {
                 Ok(writer) => writer,
                 Err(e) => {
                     errors.push(ErrorInfo {
@@ -394,7 +450,7 @@ impl<D: DataPlane> ExecutorImpl<D> {
             }
         }
 
-        JobResult {
+        Ok(JobResult {
             job_name: config.name.clone(),
             workload_type: "write".to_string(),
             iterations_completed,
@@ -403,22 +459,12 @@ impl<D: DataPlane> ExecutorImpl<D> {
             errors,
             read_stats: None,
             write_stats: Some(write_stats),
-        }
+        })
     }
 
     async fn execute_sequential_read(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
-        let client = &self.client;
-        let bucket = &config.bucket;
-        let object_key = &config.object_key;
-
-        let head_result = client
-            .head_object(bucket, object_key, &HeadObjectParams::new())
-            .await
-            .map_err(|e| ExecutionError::S3Error(format!("HeadObject failed: {}", e)))?;
-
-        let etag = head_result.etag;
-        let size = head_result.size;
-        let object_spec = ObjectSpec::new(bucket.clone(), object_key.clone(), etag.as_str(), size);
+        let object_spec = self.plane.head(&config.bucket, &config.object_key).await?;
+        let size = object_spec.size;
 
         let mut total_bytes = 0u64;
         let mut errors = Vec::new();
@@ -435,7 +481,7 @@ impl<D: DataPlane> ExecutorImpl<D> {
                 break;
             }
 
-            let request = self.read_plane.open_read(object_spec.clone());
+            let request = self.plane.open_read(object_spec.clone());
             let mut offset = 0;
             while offset < size {
                 if let Some(max_dur) = max_duration
@@ -487,19 +533,10 @@ impl<D: DataPlane> ExecutorImpl<D> {
     }
 
     async fn execute_random_read(&self, config: &ResolvedJobConfig) -> Result<JobResult, ExecutionError> {
-        let client = &self.client;
-        let bucket = &config.bucket;
-        let object_key = &config.object_key;
-
-        let head_result = client
-            .head_object(bucket, object_key, &HeadObjectParams::new())
-            .await
-            .map_err(|e| ExecutionError::S3Error(format!("HeadObject failed: {}", e)))?;
-
-        let etag = head_result.etag.clone();
-        let object_id = ObjectId::new(object_key.to_string(), head_result.etag);
-        let size = head_result.size;
-        let object_spec = ObjectSpec::new(bucket.clone(), object_key.clone(), etag.as_str(), size);
+        let object_spec = self.plane.head(&config.bucket, &config.object_key).await?;
+        let size = object_spec.size;
+        // Seeds the per-iteration RNG; the object's identity keeps the access pattern reproducible.
+        let object_id = object_spec.id.clone();
 
         let mut total_bytes = 0u64;
         let mut errors = Vec::new();
@@ -518,7 +555,7 @@ impl<D: DataPlane> ExecutorImpl<D> {
             }
 
             let iteration_start = Instant::now();
-            let request = self.read_plane.open_read(object_spec.clone());
+            let request = self.plane.open_read(object_spec.clone());
 
             // Create a unique, deterministic seed by combining randseed with object_id hash
             // and iteration. This ensures each object/iteration has a different but reproducible
@@ -598,192 +635,5 @@ impl<D: DataPlane> ExecutorImpl<D> {
             read_stats: Some(read_stats),
             write_stats: None,
         })
-    }
-
-    async fn execute_multipart_upload_iteration(
-        &self,
-        config: &ResolvedJobConfig,
-        contents: &[u8],
-        max_duration: Option<std::time::Duration>,
-        job_start: Instant,
-    ) -> Result<u64, ErrorInfo> {
-        let uploader = &self.uploader;
-        let bucket = &config.bucket;
-        let object_key = &config.object_key;
-
-        let mut request = uploader
-            .start_atomic_upload(bucket.to_string(), object_key.to_string())
-            .map_err(|e| ErrorInfo {
-                error_type: "StartUploadError".to_string(),
-                message: format!("Failed to start upload: {}", e),
-            })?;
-
-        let mut offset = 0;
-        let target_size = config.object_size as usize;
-        while offset < target_size {
-            if let Some(max_dur) = max_duration
-                && job_start.elapsed() >= max_dur
-            {
-                break;
-            }
-
-            let bytes_written = request.write(offset as i64, contents).await.map_err(|e| ErrorInfo {
-                error_type: "WriteError".to_string(),
-                message: format!("Write failed at offset {}: {}", offset, e),
-            })?;
-
-            offset += bytes_written;
-        }
-
-        if offset < target_size {
-            return Err(ErrorInfo {
-                error_type: "IncompleteUpload".to_string(),
-                message: format!("Upload incomplete: wrote {} of {} bytes", offset, target_size),
-            });
-        }
-
-        request.complete().await.map_err(|e| ErrorInfo {
-            error_type: "CompleteError".to_string(),
-            message: format!("Failed to complete upload: {}", e),
-        })?;
-
-        Ok(offset as u64)
-    }
-
-    async fn execute_multipart_upload(&self, config: &ResolvedJobConfig) -> JobResult {
-        let mut total_bytes = 0u64;
-        let mut errors = Vec::new();
-        let mut iterations_completed = 0usize;
-
-        let job_start = Instant::now();
-        let max_duration = config.max_duration;
-
-        // Allocate buffer once and reuse it for all writes
-        let contents = vec![0xab; config.write_size];
-
-        for _iteration in 0..config.iterations {
-            if let Some(max_dur) = max_duration
-                && job_start.elapsed() >= max_dur
-            {
-                break;
-            }
-
-            match self
-                .execute_multipart_upload_iteration(config, &contents, max_duration, job_start)
-                .await
-            {
-                Ok(bytes_written) => {
-                    total_bytes += bytes_written;
-                    iterations_completed += 1;
-                }
-                Err(error) => {
-                    errors.push(error);
-                }
-            }
-        }
-
-        let duration = job_start.elapsed();
-
-        JobResult {
-            job_name: config.name.clone(),
-            workload_type: "write".to_string(),
-            iterations_completed,
-            total_bytes,
-            elapsed_seconds: duration,
-            errors,
-            read_stats: None,
-            write_stats: None,
-        }
-    }
-
-    async fn execute_incremental_upload_iteration(
-        &self,
-        config: &ResolvedJobConfig,
-        contents: &[u8],
-        max_duration: Option<std::time::Duration>,
-        job_start: Instant,
-    ) -> Result<u64, ErrorInfo> {
-        let uploader = &self.uploader;
-        let bucket = &config.bucket;
-        let object_key = &config.object_key;
-
-        let mut request = uploader.start_incremental_upload(bucket.to_string(), object_key.to_string(), 0, None);
-
-        let mut offset = 0u64;
-        let target_size = config.object_size;
-        while offset < target_size {
-            if let Some(max_dur) = max_duration
-                && job_start.elapsed() >= max_dur
-            {
-                break;
-            }
-
-            request.write(offset, contents).await.map_err(|e| ErrorInfo {
-                error_type: "IncrementalWriteError".to_string(),
-                message: format!("Incremental write failed at offset {}: {}", offset, e),
-            })?;
-
-            offset += contents.len() as u64;
-        }
-
-        if offset < target_size {
-            return Err(ErrorInfo {
-                error_type: "IncompleteUpload".to_string(),
-                message: format!("Upload incomplete: wrote {} of {} bytes", offset, target_size),
-            });
-        }
-
-        request.complete().await.map_err(|e| ErrorInfo {
-            error_type: "CompleteError".to_string(),
-            message: format!("Failed to complete upload: {}", e),
-        })?;
-
-        Ok(offset)
-    }
-
-    async fn execute_incremental_upload(&self, config: &ResolvedJobConfig) -> JobResult {
-        let mut total_bytes = 0u64;
-        let mut errors = Vec::new();
-        let mut iterations_completed = 0usize;
-
-        let job_start = Instant::now();
-        let max_duration = config.max_duration;
-
-        // Allocate buffer once and reuse it for all writes
-        let contents = vec![0xab; config.write_size];
-
-        for _iteration in 0..config.iterations {
-            if let Some(max_dur) = max_duration
-                && job_start.elapsed() >= max_dur
-            {
-                break;
-            }
-
-            match self
-                .execute_incremental_upload_iteration(config, &contents, max_duration, job_start)
-                .await
-            {
-                Ok(bytes_written) => {
-                    total_bytes += bytes_written;
-                    iterations_completed += 1;
-                }
-                Err(error) => {
-                    errors.push(error);
-                }
-            }
-        }
-
-        let duration = job_start.elapsed();
-
-        JobResult {
-            job_name: config.name.clone(),
-            workload_type: "write".to_string(),
-            iterations_completed,
-            total_bytes,
-            elapsed_seconds: duration,
-            errors,
-            read_stats: None,
-            write_stats: None,
-        }
     }
 }
