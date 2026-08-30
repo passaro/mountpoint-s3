@@ -320,6 +320,9 @@ fn build_rtm_plane(global: &GlobalConfig) -> Result<RtmBenchPlane, ExecutionErro
     if let Some(bytes) = global.rtm_initial_request_size {
         config.initial_request_size = bytes;
     }
+    if let Some(m) = global.rtm_read_ahead_multiplier {
+        config.read_ahead_multiplier = m;
+    }
     // The RTM writer cuts parts at its own `write_part_size`, independent of the read part size above.
     if let Some(bytes) = global.write_part_size {
         config.writer.write_part_size = bytes;

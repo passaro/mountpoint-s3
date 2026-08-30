@@ -49,6 +49,10 @@ pub struct GlobalConfig {
     /// 1 MiB + 128 KiB the prefetcher uses.
     pub rtm_initial_request_size: Option<u64>,
 
+    /// Factor read-ahead depth grows by per stall, for `data_plane = "rtm"`. Values below 2 are
+    /// raised to 2 (a multiplier of 1 would never grow). Default: 2.
+    pub rtm_read_ahead_multiplier: Option<usize>,
+
     // === Job defaults (optional, overridable per job) ===
     #[serde(flatten)]
     pub job_defaults: JobConfig,
@@ -349,6 +353,7 @@ mod tests {
         let config: Config = toml::from_str(toml).expect("parses");
         assert_eq!(config.global.data_plane, DataPlaneKind::Prefetcher);
         assert_eq!(config.global.rtm_read_ahead_bytes, None);
+        assert_eq!(config.global.rtm_read_ahead_multiplier, None);
     }
 
     #[test]
@@ -358,12 +363,14 @@ mod tests {
             bucket = "b"
             data_plane = "rtm"
             rtm_read_ahead_bytes = 16777216
+            rtm_read_ahead_multiplier = 4
             [jobs.j]
             workload_type = "read"
         "#;
         let config: Config = toml::from_str(toml).expect("parses");
         assert_eq!(config.global.data_plane, DataPlaneKind::Rtm);
         assert_eq!(config.global.rtm_read_ahead_bytes, Some(16 * 1024 * 1024));
+        assert_eq!(config.global.rtm_read_ahead_multiplier, Some(4));
     }
 
     #[test]
