@@ -498,9 +498,13 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
                 match request.read_at(offset, read_size as usize).await {
                     Ok(segments) => {
                         let chunks = segments.chunk_count();
-                        let buffer = segments.to_contiguous();
-                        read_stats.add_read(buffer.len(), chunks);
-                        let bytes_read = buffer.len() as u64;
+                        // Count the bytes without flattening the segments into one buffer.
+                        // `to_contiguous()` memcpies every chunk when a read spans more than one —
+                        // 100% of bytes on the RTM arm, which delivers ~16 chunks/read — a cost the
+                        // benchmark's own accounting never needs (it only uses the length). A real
+                        // FUSE `reply.data()` would still have to pay it.
+                        let bytes_read = segments.len() as u64;
+                        read_stats.add_read(bytes_read as usize, chunks);
                         offset += bytes_read;
                         total_bytes += bytes_read;
                     }
@@ -602,9 +606,13 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
                 match request.read_at(offset, read_size as usize).await {
                     Ok(segments) => {
                         let chunks = segments.chunk_count();
-                        let buffer = segments.to_contiguous();
-                        read_stats.add_read(buffer.len(), chunks);
-                        let bytes_read = buffer.len() as u64;
+                        // Count the bytes without flattening the segments into one buffer.
+                        // `to_contiguous()` memcpies every chunk when a read spans more than one —
+                        // 100% of bytes on the RTM arm, which delivers ~16 chunks/read — a cost the
+                        // benchmark's own accounting never needs (it only uses the length). A real
+                        // FUSE `reply.data()` would still have to pay it.
+                        let bytes_read = segments.len() as u64;
+                        read_stats.add_read(bytes_read as usize, chunks);
                         bytes_read_this_iteration += bytes_read;
                         total_bytes += bytes_read;
                     }

@@ -51,16 +51,19 @@ pub struct ReadStats {
     pub cache_hits: u64,
     pub cursors_opened: u64,
 
-    /// `read_at` calls that returned more than one chunk, and so had to be copied to be made
-    /// contiguous.
+    /// `read_at` calls that returned more than one chunk, and so would have to be copied to be
+    /// made contiguous.
     ///
     /// Counted by the benchmark, not the reader: fragmentation is a property of what the
-    /// reader handed back, and the cost of resolving it falls on the consumer. Always 0 on
-    /// the prefetcher arm, whose `Segments` is always a single chunk.
+    /// reader handed back, and the cost of resolving it falls on the consumer. The benchmark
+    /// itself no longer pays that cost — it consumes the `Segments` by length and never
+    /// flattens them — so this is the copy a contiguity-requiring consumer (a real FUSE
+    /// `reply.data()`) *would* incur, which is what makes it comparable between backends.
+    /// Always 0 on the prefetcher arm, whose `Segments` is always a single chunk.
     pub reads_copied: u64,
-    /// Bytes moved by those copies — the volume `reads_copied` cost, which the count alone
-    /// does not give, since a fragmented 1 MiB read is far more expensive than a fragmented
-    /// 4 KiB one.
+    /// Bytes those copies would move — the volume `reads_copied` represents, which the count
+    /// alone does not give, since a fragmented 1 MiB read is far more expensive than a
+    /// fragmented 4 KiB one.
     pub bytes_copied: u64,
     /// Chunks summed over every `read_at`. Over `read_at` count this is the mean
     /// fragmentation; 1.0 means every read arrived in one piece.
