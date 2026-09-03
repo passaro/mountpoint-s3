@@ -124,6 +124,24 @@ impl Segments {
             }
         }
     }
+
+    /// Copy every chunk, in order, into `dst`, leaving `dst` holding exactly this run's bytes.
+    ///
+    /// The reusable-buffer counterpart of [`to_contiguous`](Self::to_contiguous): a caller that
+    /// consumes many reads can keep one `Vec` and refill it here, paying no per-read allocation.
+    /// That allocation — a fresh heap buffer freed immediately after each read — is the dominant
+    /// cost of `to_contiguous` when reads are small and frequent, so a consumer that needs
+    /// contiguity but can reuse storage should prefer this.
+    ///
+    /// `dst` is cleared first; its capacity is retained across calls, so after the first read that
+    /// reaches this run's size no reallocation happens.
+    pub fn copy_into(&self, dst: &mut Vec<u8>) {
+        dst.clear();
+        dst.reserve(self.len);
+        for chunk in &self.chunks {
+            dst.extend_from_slice(chunk);
+        }
+    }
 }
 
 impl From<Bytes> for Segments {
@@ -230,5 +248,20 @@ mod tests {
         let s = Segments::from(original.clone());
         // Same allocation, so this is a refcount bump rather than a copy.
         assert_eq!(s.to_contiguous().as_ptr(), original.as_ptr());
+    }
+
+    #[test]
+    fn copy_into_joins_in_order_and_reuses_capacity() {
+        let mut dst = Vec::new();
+        seg(&["ab", "cd", "e"]).copy_into(&mut dst);
+        assert_eq!(&dst[..], b"abcde");
+        let cap = dst.capacity();
+        // A smaller run reuses the buffer without growing it.
+        seg(&["xy"]).copy_into(&mut dst);
+        assert_eq!(&dst[..], b"xy");
+        assert_eq!(dst.capacity(), cap);
+        // An empty run empties the buffer.
+        Segments::new().copy_into(&mut dst);
+        assert!(dst.is_empty());
     }
 }

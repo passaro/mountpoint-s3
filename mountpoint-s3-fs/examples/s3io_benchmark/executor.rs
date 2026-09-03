@@ -476,6 +476,9 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
 
         let job_start = Instant::now();
         let max_duration = config.max_duration;
+        // Reused across every read so flattening the segments allocates only once (grows to the read
+        // size on the first read, then reused). Isolates the copy cost from allocator churn.
+        let mut scratch: Vec<u8> = Vec::new();
 
         for _iteration in 0..config.iterations {
             if let Some(max_dur) = max_duration
@@ -498,12 +501,12 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
                 match request.read_at(offset, read_size as usize).await {
                     Ok(segments) => {
                         let chunks = segments.chunk_count();
-                        // Count the bytes without flattening the segments into one buffer.
-                        // `to_contiguous()` memcpies every chunk when a read spans more than one —
-                        // 100% of bytes on the RTM arm, which delivers ~16 chunks/read — a cost the
-                        // benchmark's own accounting never needs (it only uses the length). A real
-                        // FUSE `reply.data()` would still have to pay it.
-                        let bytes_read = segments.len() as u64;
+                        // Flatten into the reused scratch buffer: the bytes are actually copied
+                        // contiguous (as a real FUSE `reply.data()` consumer needs), but the target
+                        // buffer is reused across reads, so there is no per-read allocation — the
+                        // dominant cost of the per-read `to_contiguous()` this replaces.
+                        segments.copy_into(&mut scratch);
+                        let bytes_read = scratch.len() as u64;
                         read_stats.add_read(bytes_read as usize, chunks);
                         offset += bytes_read;
                         total_bytes += bytes_read;
@@ -553,6 +556,8 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
         let job_start = Instant::now();
         let max_duration = config.max_duration;
         let iteration_duration = config.iteration_duration;
+        // Reused across every read (see execute_sequential_read).
+        let mut scratch: Vec<u8> = Vec::new();
 
         for iteration in 0..config.iterations {
             if let Some(max_dur) = max_duration
@@ -606,12 +611,9 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
                 match request.read_at(offset, read_size as usize).await {
                     Ok(segments) => {
                         let chunks = segments.chunk_count();
-                        // Count the bytes without flattening the segments into one buffer.
-                        // `to_contiguous()` memcpies every chunk when a read spans more than one —
-                        // 100% of bytes on the RTM arm, which delivers ~16 chunks/read — a cost the
-                        // benchmark's own accounting never needs (it only uses the length). A real
-                        // FUSE `reply.data()` would still have to pay it.
-                        let bytes_read = segments.len() as u64;
+                        // Flatten into the reused scratch buffer (see execute_sequential_read).
+                        segments.copy_into(&mut scratch);
+                        let bytes_read = scratch.len() as u64;
                         read_stats.add_read(bytes_read as usize, chunks);
                         bytes_read_this_iteration += bytes_read;
                         total_bytes += bytes_read;
