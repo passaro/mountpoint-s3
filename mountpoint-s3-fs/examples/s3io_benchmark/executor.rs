@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use mountpoint_s3_client::config::{Allocator, EndpointConfig, S3ClientConfig, Uri};
 use mountpoint_s3_client::types::HeadObjectParams;
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
-use mountpoint_s3_fs::data::{CrtDataPlane, DataPlane, ObjectSpec, Reader, WriteError, WriteSpec, Writer};
+use mountpoint_s3_fs::data::{CrtDataPlane, DataPlane, ObjectSpec, Reader, Segments, WriteError, WriteSpec, Writer};
 use mountpoint_s3_fs::memory::effective_total_memory;
 use mountpoint_s3_fs::memory::{CandidateSize, PagedPool};
 use mountpoint_s3_fs::prefetch::{Prefetcher, PrefetcherConfig};
@@ -477,7 +477,21 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
         let job_start = Instant::now();
         let max_duration = config.max_duration;
 
-        for _iteration in 0..config.iterations {
+        // Software pipeline: hand each read's segments to one long-lived copy thread over a bounded
+        // channel, so the per-byte contiguity copy overlaps transfer instead of serializing after it.
+        // A dedicated thread (not spawn_blocking per read) keeps the hand-off to a channel push rather
+        // than a task spawn, and the copy thread reuses one buffer, so there is no per-read allocation.
+        // The bounded channel backpressures the reader to the copy rate, so throughput is
+        // max(transfer, copy) rather than their sum.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Segments>(3);
+        let copy_thread = std::thread::spawn(move || {
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(segments) = rx.blocking_recv() {
+                segments.copy_into(&mut buf);
+            }
+        });
+
+        'iterations: for _iteration in 0..config.iterations {
             if let Some(max_dur) = max_duration
                 && job_start.elapsed() >= max_dur
             {
@@ -486,12 +500,6 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
 
             let request = self.plane.open_read(object_spec.clone());
             let mut offset = 0;
-            // Software pipeline: the contiguity copy of read N-1 runs on a blocking thread while
-            // read N is issued/awaited, so the per-byte copy overlaps transfer instead of serializing
-            // after it. One copy is in flight at a time; a single buffer ping-pongs through the copy
-            // task (moved in, returned out), so there is still no per-read allocation.
-            let mut inflight: Option<tokio::task::JoinHandle<Vec<u8>>> = None;
-            let mut buf: Vec<u8> = Vec::new();
             while offset < size {
                 if let Some(max_dur) = max_duration
                     && job_start.elapsed() >= max_dur
@@ -505,20 +513,14 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
                     Ok(segments) => {
                         let chunks = segments.chunk_count();
                         let bytes_read = segments.len() as u64;
-                        // Reclaim the buffer from the previous read's copy. Because that copy ran on a
-                        // blocking thread during this read_at, it is usually already done, so this
-                        // rarely blocks — the copy has been moved off the critical path.
-                        if let Some(handle) = inflight.take() {
-                            buf = handle.await.expect("copy task panicked");
-                        }
-                        let mut b = std::mem::take(&mut buf);
-                        inflight = Some(tokio::task::spawn_blocking(move || {
-                            segments.copy_into(&mut b);
-                            b
-                        }));
                         read_stats.add_read(bytes_read as usize, chunks);
                         offset += bytes_read;
                         total_bytes += bytes_read;
+                        // Hand the segments to the copy thread; awaits (backpressure) when the channel
+                        // is full. If the copy thread is gone, stop.
+                        if tx.send(segments).await.is_err() {
+                            break 'iterations;
+                        }
                     }
                     Err(e) => {
                         errors.push(ErrorInfo {
@@ -529,10 +531,6 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
                     }
                 }
             }
-            // Drain the final in-flight copy before moving to the next iteration.
-            if let Some(handle) = inflight.take() {
-                let _ = handle.await;
-            }
 
             read_stats.add(request.stats());
 
@@ -540,6 +538,9 @@ impl<D: DataPlane + Head> ExecutorImpl<D> {
                 iterations_completed += 1;
             }
         }
+        // Close the channel and wait for the copy thread to finish the tail.
+        drop(tx);
+        let _ = copy_thread.join();
 
         let duration = job_start.elapsed();
 
