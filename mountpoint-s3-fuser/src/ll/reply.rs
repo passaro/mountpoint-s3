@@ -22,6 +22,10 @@ pub enum Response<'a> {
     Error(i32),
     Data(ResponseBuf),
     Slice(&'a [u8]),
+    /// A payload delivered as several non-contiguous slices, written to `/dev/fuse` as one
+    /// vectored write (the header plus each slice as its own `iovec` entry). Lets a chunked reader
+    /// (e.g. the RTM data plane's `Segments`) reply without first concatenating into one buffer.
+    Slices(&'a [&'a [u8]]),
 }
 
 impl<'a> Response<'a> {
@@ -34,6 +38,7 @@ impl<'a> Response<'a> {
             Response::Error(_) => 0,
             Response::Data(v) => v.len(),
             Response::Slice(d) => d.len(),
+            Response::Slices(s) => s.iter().map(|d| d.len()).sum(),
         };
         let header = abi::fuse_out_header {
             unique: unique.0,
@@ -51,6 +56,11 @@ impl<'a> Response<'a> {
             Response::Error(_) => {}
             Response::Data(d) => v.push(IoSlice::new(d)),
             Response::Slice(d) => v.push(IoSlice::new(d)),
+            Response::Slices(s) => {
+                for d in *s {
+                    v.push(IoSlice::new(d));
+                }
+            }
         }
         f(&v)
     }
@@ -74,6 +84,10 @@ impl<'a> Response<'a> {
 
     pub(crate) fn new_slice(data: &'a [u8]) -> Self {
         Self::Slice(data)
+    }
+
+    pub(crate) fn new_slices(slices: &'a [&'a [u8]]) -> Self {
+        Self::Slices(slices)
     }
 
     pub(crate) fn new_entry(

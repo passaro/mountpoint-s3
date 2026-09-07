@@ -124,6 +124,13 @@ impl Segments {
             }
         }
     }
+
+    /// Borrow the chunks, in order, as slices for a single vectored write — the copy-free way
+    /// to hand this run to something that writes an `iovec`, such as a FUSE `reply.data_vectored()`.
+    /// No bytes are copied, the returned slices borrow `self`.
+    pub fn io_slices(&self) -> Vec<&'_ [u8]> {
+        self.chunks.iter().map(|c| c.as_ref()).collect()
+    }
 }
 
 impl From<Bytes> for Segments {
@@ -231,4 +238,17 @@ mod tests {
         // Same allocation, so this is a refcount bump rather than a copy.
         assert_eq!(s.to_contiguous().as_ptr(), original.as_ptr());
     }
-}
+
+    #[test]
+    fn io_slices_borrow_chunks_in_order() {
+        let s = seg(&["ab", "cd", "e"]);
+        let iov = s.io_slices();
+        // One slice per chunk, same order, no concatenation.
+        assert_eq!(iov.len(), 3);
+        assert_eq!(iov.iter().map(|d| d.len()).sum::<usize>(), s.len());
+        let joined: Vec<u8> = iov.iter().flat_map(|d| d.iter().copied()).collect();
+        assert_eq!(&joined[..], b"abcde");
+        assert_eq!(&joined[..], &s.to_contiguous()[..]);
+        // An empty run yields no slices.
+        assert!(Segments::new().io_slices().is_empty());
+    }}

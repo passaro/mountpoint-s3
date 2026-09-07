@@ -160,7 +160,12 @@ where
         match block_on(self.fs.read(ino, fh, offset, size, flags, lock).in_current_span()) {
             Ok(data) => {
                 bytes_sent = data.len();
-                reply.data(&data);
+                // FAKE (testing only): the read path still returns one contiguous `Bytes`, but to
+                // exercise the vectored reply with a realistic chunk count we split it into 8 KiB
+                // slices — mimicking the ~16 chunks/128 KiB the RTM `Segments` would deliver.
+                // The slices borrow `data` in place (no copy), so it must outlive this call.
+                let slices: Vec<_> = data.chunks(8 * 1024).collect();
+                reply.data_vectored(&slices);
             }
             Err(err) => fuse_error!("read", reply, err, self, req),
         }
