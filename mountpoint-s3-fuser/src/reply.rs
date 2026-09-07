@@ -157,6 +157,14 @@ impl ReplyData {
         self.reply.send_ll(&ll::Response::new_slice(data));
     }
 
+    /// Reply to a request with data delivered as several non-contiguous slices.
+    ///
+    /// The slices are written to `/dev/fuse` as a single vectored write (header + one `iovec` entry
+    /// per slice), so a chunked reader can reply without flattening its chunks into one buffer first.
+    pub fn data_vectored(self, slices: &[&[u8]]) {
+        self.reply.send_ll(&ll::Response::new_slices(slices));
+    }
+
     /// Reply to a request with the given error code
     pub fn error(self, err: c_int) {
         self.reply.error(err);
@@ -799,6 +807,20 @@ mod test {
         };
         let reply: ReplyData = Reply::new(0xdeadbeef, sender);
         reply.data(&[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn reply_data_vectored() {
+        // Two non-contiguous slices must land on the wire as one payload identical to reply_data's:
+        // header (len 0x14) followed by the concatenated bytes, without the caller concatenating.
+        let sender = AssertSender {
+            expected: vec![
+                0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde, 0x00, 0x00,
+                0x00, 0x00, 0xde, 0xad, 0xbe, 0xef,
+            ],
+        };
+        let reply: ReplyData = Reply::new(0xdeadbeef, sender);
+        reply.data_vectored(&[&[0xde, 0xad], &[0xbe, 0xef]]);
     }
 
     #[test]
