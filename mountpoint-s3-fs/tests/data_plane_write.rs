@@ -279,8 +279,7 @@ async fn rtm_rejects_incremental_upload() {
     let err = fx
         .plane
         .open_write(WriteSpec::incremental("test-bucket", "object"))
-        .err()
-        .expect("RTM must reject an incremental upload");
+        .expect_err("RTM must reject an incremental upload");
     assert!(matches!(err, WriteError::IncrementalUnsupported), "got {err:?}");
 
     let log = fx.log();
