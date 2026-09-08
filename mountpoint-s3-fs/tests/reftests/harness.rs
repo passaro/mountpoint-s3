@@ -763,7 +763,7 @@ impl Harness {
                 .read(fs_ino, fh, offset as i64, num_bytes as u32, 0, None)
                 .await
                 .expect("read should succeed");
-            assert_eq!(&ref_bytes[..], &bytes_from_read, "read bytes did not match");
+            assert_eq!(&ref_bytes[..], &bytes_from_read.to_contiguous()[..], "read bytes did not match");
             offset += num_bytes;
         }
     }

@@ -12,7 +12,10 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tracing::{Level, debug, trace};
 
+use std::marker::PhantomData;
+
 use crate::async_util::Runtime;
+use crate::data::{CrtDataPlane, DataPlane, Reader, Segments};
 use crate::logging;
 use crate::memory::PagedPool;
 use crate::memory::WriteHandleLimiter;
@@ -20,7 +23,7 @@ use crate::metablock::{
     AddDirEntry, AddDirEntryResult, InodeInformation, Metablock, NewHandle, PendingUploadHook, ReadWriteMode,
 };
 pub use crate::metablock::{InodeError, InodeKind, InodeNo};
-use crate::prefetch::{Prefetcher, PrefetcherBuilder};
+use crate::prefetch::PrefetcherBuilder;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, AsyncMutex, AsyncRwLock};
 use crate::upload::{Uploader, UploaderConfig};
@@ -49,17 +52,24 @@ pub use time_to_live::TimeToLive;
 
 pub const FUSE_ROOT_INODE: InodeNo = 1u64;
 
-pub struct S3Filesystem<Client>
+/// The filesystem, parameterized over the [`DataPlane`] that moves object bytes.
+///
+/// `DP` defaults to [`CrtDataPlane`], the CRT-backed prefetcher/uploader, so `S3Filesystem<Client>`
+/// still names the production filesystem. `Client` is retained because the default backend is built
+/// from an [`ObjectClient`] (and its `write_part_size` sizes the write-handle limiter); it is not
+/// otherwise stored, hence the `PhantomData`.
+pub struct S3Filesystem<Client, DP = CrtDataPlane<Client>>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
+    DP: DataPlane,
 {
     config: S3FilesystemConfig,
     metablock: Arc<dyn Metablock>,
-    prefetcher: Prefetcher<Client>,
-    uploader: Uploader<Client>,
+    data_plane: DP,
     write_handle_limiter: Option<WriteHandleLimiter>,
     next_handle: AtomicU64,
-    file_handles: AsyncRwLock<HashMap<u64, Arc<FileHandle<Client>>>>,
+    file_handles: AsyncRwLock<HashMap<u64, Arc<FileHandle<DP>>>>,
+    _phantom: PhantomData<Client>,
 }
 
 /// Reply to a `lookup` call
@@ -138,10 +148,11 @@ impl Default for StatFs {
     }
 }
 
-impl<Client> S3Filesystem<Client>
+impl<Client> S3Filesystem<Client, CrtDataPlane<Client>>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
+    /// Build a filesystem on the default CRT data plane (the existing prefetcher and uploader).
     pub fn new(
         client: Client,
         prefetch_builder: PrefetcherBuilder<Client>,
@@ -153,28 +164,51 @@ where
         trace!(?config, "new filesystem");
 
         let pool = pool.clone();
-        let write_handle_limiter = (!config.read_only)
-            .then(|| WriteHandleLimiter::new(pool.mem_limit(), pool.write_buffer_budget(), client.write_part_size()));
+        let write_part_size = client.write_part_size();
         let prefetcher = prefetch_builder.build(runtime.clone(), pool.clone(), config.prefetcher_config);
         let uploader = Uploader::new(
             client.clone(),
             runtime,
-            pool,
-            UploaderConfig::new(client.write_part_size())
+            pool.clone(),
+            UploaderConfig::new(write_part_size)
                 .storage_class(config.storage_class.to_owned())
                 .server_side_encryption(config.server_side_encryption.clone())
                 .default_checksum_algorithm(config.upload_checksum_algorithm.map(Into::into))
                 .content_type_detection(config.content_type_detection),
         );
+        let data_plane = CrtDataPlane::new(prefetcher, uploader);
+
+        Self::new_with_data_plane(data_plane, write_part_size, pool, metablock, config)
+    }
+}
+
+impl<Client, DP> S3Filesystem<Client, DP>
+where
+    Client: ObjectClient + Clone + Send + Sync + 'static,
+    DP: DataPlane + 'static,
+{
+    /// Build a filesystem on an arbitrary [`DataPlane`].
+    ///
+    /// `write_part_size` sizes the write-handle limiter and comes from whatever produced the data
+    /// plane (the [`ObjectClient`] on the CRT path).
+    pub fn new_with_data_plane(
+        data_plane: DP,
+        write_part_size: usize,
+        pool: PagedPool,
+        metablock: impl Metablock + 'static,
+        config: S3FilesystemConfig,
+    ) -> Self {
+        let write_handle_limiter = (!config.read_only)
+            .then(|| WriteHandleLimiter::new(pool.mem_limit(), pool.write_buffer_budget(), write_part_size));
 
         Self {
             config,
             metablock: Arc::new(metablock),
-            prefetcher,
-            uploader,
+            data_plane,
             write_handle_limiter,
             next_handle: AtomicU64::new(1),
             file_handles: AsyncRwLock::new(HashMap::new()),
+            _phantom: PhantomData,
         }
     }
 
@@ -410,7 +444,7 @@ where
         size: u32,
         _flags: i32,
         _lock: Option<u64>,
-    ) -> Result<Bytes, Error> {
+    ) -> Result<Segments, Error> {
         trace!(
             "fs:read with ino {:?} fh {:?} offset {:?} size {:?}",
             ino, fh, offset, size
@@ -420,7 +454,7 @@ where
             // This compile-time configuration allows us to return simply zeroes to FUSE,
             // allowing us to remove Mountpoint's logic from the loop and compare performance
             // with and without the rest of Mountpoint's logic (such as file handle interaction, prefetcher, etc.).
-            return Ok(vec![0u8; size as usize].into());
+            return Ok(Segments::from(Bytes::from(vec![0u8; size as usize])));
         }
 
         let handle = {
@@ -433,8 +467,8 @@ where
         logging::record_name(handle.file_name());
 
         let mut state = handle.state.lock().await;
-        let (request, flushed) = match &mut *state {
-            FileHandleState::Read { request, flushed } => (request, flushed),
+        let (reader, flushed) = match &mut *state {
+            FileHandleState::Read { reader, flushed } => (reader, flushed),
             FileHandleState::Write { .. } => return Err(err!(libc::EBADF, "file handle is not open for reads")),
         };
 
@@ -453,11 +487,7 @@ where
             }
             *flushed = false;
         }
-        request
-            .read(offset as u64, size as usize)
-            .await?
-            .into_bytes()
-            .map_err(|e| err!(libc::EIO, source:e, "integrity error"))
+        Ok(reader.read_at(offset as u64, size as usize).await?)
     }
 
     pub async fn mknod(
@@ -901,7 +931,7 @@ mod tests {
             .expect("open before the corruption should succeed");
 
         // Open a file for write in "dir1" after corruption
-        fs.uploader
+        fs.data_plane
             .corrupt_sse(Some("aws:kmr".to_owned()), Some("some_key_alias".to_owned()));
         let dentry = fs
             .mknod(dir_ino, "file3.bin".as_ref(), libc::S_IFREG | libc::S_IRWXU, 0, 0)
@@ -915,7 +945,7 @@ mod tests {
         assert_eq!(err.errno, libc::EIO);
         assert_eq!(
             format!("{err}"),
-            "put failed to start: SSE settings corrupted: Checksum mismatch. expected: Crc32c(752912206), actual: Crc32c(1265531471)"
+            "write failed: transfer failed: SSE settings corrupted: Checksum mismatch. expected: Crc32c(752912206), actual: Crc32c(1265531471)"
         );
     }
 

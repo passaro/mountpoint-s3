@@ -98,7 +98,7 @@ async fn test_read_dir_root(prefix: &str) {
             .read(reply.ino, fh, 0, 4096, 0, None)
             .await
             .expect("fs read should succeed");
-        assert_eq!(&bytes_read[..], &[0xa0 + (i as u8 + 1); 15]);
+        assert_eq!(&bytes_read.to_contiguous()[..], &[0xa0 + (i as u8 + 1); 15]);
         fs.release(reply.ino, fh, 0, None, true).await.unwrap();
 
         offset = offset.max(reply.offset);
@@ -173,7 +173,7 @@ async fn test_read_dir_nested(prefix: &str) {
             .read(reply.ino, fh, 0, 4096, 0, None)
             .await
             .expect("fs read should succeed");
-        assert_eq!(&bytes_read[..], &[0xa0 + (i as u8 + 1); 15]);
+        assert_eq!(&bytes_read.to_contiguous()[..], &[0xa0 + (i as u8 + 1); 15]);
         fs.release(reply.ino, fh, 0, None, true).await.unwrap();
 
         offset = offset.max(reply.offset);
@@ -471,7 +471,7 @@ async fn test_random_read(object_size: usize) {
             .await
             .expect("fs read should succeed");
         assert_eq!(bytes_read.len(), length);
-        assert_eq!(&bytes_read[..], &expected[offset..offset + length]);
+        assert_eq!(&bytes_read.to_contiguous()[..], &expected[offset..offset + length]);
     }
 
     fs.release(ino, fh, 0, None, true).await.unwrap();
@@ -519,7 +519,7 @@ async fn test_implicit_directory_shadow(prefix: &str) {
         .read(reply.entries[2].ino, fh, 0, 4096, 0, None)
         .await
         .expect("fs read should succeed");
-    assert_eq!(&bytes_read[..], &[0xa2; 15]);
+    assert_eq!(&bytes_read.to_contiguous()[..], &[0xa2; 15]);
     fs.release(reply.entries[2].ino, fh, 0, None, true).await.unwrap();
 
     // Explicitly looking up the shadowed file should fail
@@ -613,7 +613,7 @@ async fn test_sequential_write(write_size: usize) {
             .await
             .expect("fs read should succeed");
         assert_eq!(bytes_read.len(), length);
-        assert_eq!(&bytes_read[..], &body[offset..offset + length]);
+        assert_eq!(&bytes_read.to_contiguous()[..], &body[offset..offset + length]);
         offset += length;
     }
 

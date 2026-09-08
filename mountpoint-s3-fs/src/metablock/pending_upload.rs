@@ -1,6 +1,6 @@
-use mountpoint_s3_client::ObjectClient;
 use std::pin::Pin;
 
+use crate::data::DataPlane;
 use crate::fs::{FileHandle, FileHandleState};
 use crate::sync::{Arc, AsyncMutex};
 
@@ -37,9 +37,9 @@ impl std::fmt::Debug for PendingUploadHookState {
 }
 
 impl PendingUploadHook {
-    pub(crate) fn new<Client>(metablock: Arc<dyn Metablock>, handle: Arc<FileHandle<Client>>, fh: u64) -> Self
+    pub(crate) fn new<DP>(metablock: Arc<dyn Metablock>, handle: Arc<FileHandle<DP>>, fh: u64) -> Self
     where
-        Client: ObjectClient + Clone + Send + Sync + 'static,
+        DP: DataPlane + 'static,
     {
         let ino = handle.ino;
         let location = handle.location.clone();
