@@ -15,36 +15,21 @@ use crate::{Runtime, S3Filesystem, S3FilesystemConfig};
 /// Which [`DataPlane`](crate::data::DataPlane) the filesystem reads and writes through.
 ///
 /// Defaults to [`Crt`](DataPlaneKind::Crt), the CRT-backed prefetcher/uploader — the production
-/// path. [`Rtm`](DataPlaneKind::Rtm) selects the experimental AWS S3 Transfer Manager backend and
-/// is only available when the crate is built with the `rtm_data_plane` feature; it does not
-/// validate read checksums and cannot express append (incremental) uploads, which fail at open with
+/// path. [`Rtm`](DataPlaneKind::Rtm) carries an already-built AWS S3 Transfer Manager data plane and
+/// is only available when the crate is built with the `rtm_data_plane` feature; it does not validate
+/// read checksums and cannot express append (incremental) uploads, which fail at open with
 /// `EOPNOTSUPP`.
+///
+/// The caller constructs the [`RtmDataPlane`](crate::data::RtmDataPlane) from the same S3
+/// configuration (region, endpoint, part sizes, throughput/memory targets) it used to build the CRT
+/// [`ObjectClient`] this session is given, so the two cannot diverge. There is deliberately no
+/// separate RTM config struct here to fill in a second time.
 #[derive(Debug, Default)]
 pub enum DataPlaneKind {
     #[default]
     Crt,
     #[cfg(feature = "rtm_data_plane")]
-    Rtm(RtmMountConfig),
-}
-
-/// Settings for standing up the RTM transfer-manager client the [`Rtm`](DataPlaneKind::Rtm) backend
-/// drives. The transfer manager is a separate client stack from the CRT [`ObjectClient`] the mount
-/// uses for metadata.
-#[cfg(feature = "rtm_data_plane")]
-#[derive(Debug, Clone, Default)]
-pub struct RtmMountConfig {
-    /// AWS region; falls back to `us-east-1` when unset.
-    pub region: Option<String>,
-    /// Override the S3 endpoint (e.g. for a local test server).
-    pub endpoint_url: Option<String>,
-    /// Target read part size in bytes; `None` uses the transfer manager default.
-    pub read_part_size: Option<usize>,
-    /// Write part size in bytes; `None` uses the RTM writer default.
-    pub write_part_size: Option<usize>,
-    /// Target throughput in gigabits/sec; `None` uses the transfer manager default.
-    pub throughput_target_gbps: Option<usize>,
-    /// Memory budget in MiB; `None` leaves the transfer manager default.
-    pub memory_target_mib: Option<usize>,
+    Rtm(crate::data::RtmDataPlane),
 }
 
 /// Configuration for a Mountpoint session
@@ -124,8 +109,11 @@ impl MountpointConfig {
                 FuseSession::new(fuse_fs, self.fuse_session_config)?
             }
             #[cfg(feature = "rtm_data_plane")]
-            DataPlaneKind::Rtm(rtm_config) => {
-                let (data_plane, write_part_size) = build_rtm_data_plane(&rtm_config)?;
+            DataPlaneKind::Rtm(data_plane) => {
+                // The write-handle limiter is sized from the mount's client, the single source of
+                // truth for part sizing — the caller configures the RTM writer's part size from the
+                // same place, so the two agree.
+                let write_part_size = client.write_part_size();
                 let fs = S3Filesystem::new_with_data_plane(
                     data_plane,
                     write_part_size,
@@ -140,50 +128,6 @@ impl MountpointConfig {
         ctrlc::set_handler(session.shutdown_fn()).context("failed to set interrupt handler")?;
         Ok(session)
     }
-}
-
-/// Build the RTM transfer-manager data plane and report the write part size it will use (needed to
-/// size the write-handle limiter). Mirrors the `s3io_benchmark` example's setup.
-#[cfg(feature = "rtm_data_plane")]
-fn build_rtm_data_plane(config: &RtmMountConfig) -> anyhow::Result<(crate::data::RtmDataPlane, usize)> {
-    use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, TargetThroughput};
-
-    use crate::data::{RtmConfig, RtmDataPlane};
-
-    let region = config.region.clone().unwrap_or_else(|| "us-east-1".to_string());
-
-    // `load` is async; `create_fuse_session` is sync, so block on it.
-    let sdk_config = block_on(async {
-        let mut loader =
-            aws_config::defaults(aws_config::BehaviorVersion::latest()).region(aws_config::Region::new(region));
-        if let Some(url) = &config.endpoint_url {
-            loader = loader.endpoint_url(url);
-        }
-        loader.load().await
-    });
-    let s3 = aws_sdk_s3::Client::new(&sdk_config);
-
-    let mut tm_builder = aws_sdk_s3_transfer_manager::Config::builder().client(s3);
-    if let Some(read_part_size) = config.read_part_size {
-        tm_builder = tm_builder.part_size(PartSize::Target(read_part_size as u64));
-    }
-    if let Some(gbps) = config.throughput_target_gbps {
-        tm_builder = tm_builder.concurrency(ConcurrencyMode::TargetThroughput(
-            TargetThroughput::new_gigabits_per_sec(gbps as u64),
-        ));
-    }
-    if let Some(mib) = config.memory_target_mib {
-        tm_builder = tm_builder.memory_budget(MemoryBudgetConfig::Limit(mib * 1024 * 1024));
-    }
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_builder.build());
-
-    let mut rtm_config = RtmConfig::default();
-    if let Some(bytes) = config.write_part_size {
-        rtm_config.writer.write_part_size = bytes;
-    }
-    let write_part_size = rtm_config.writer.write_part_size;
-
-    Ok((RtmDataPlane::new(tm, rtm_config), write_part_size))
 }
 
 fn create_prefetcher_builder<Client>(
