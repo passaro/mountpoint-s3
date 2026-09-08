@@ -19,6 +19,7 @@ use mountpoint_s3_client::ObjectClient;
 use mountpoint_s3_client::mock_client::{MockClient, MockObject};
 use mountpoint_s3_fs::fs::{CacheConfig, FUSE_ROOT_INODE, InodeNo, OpenFlags, ToErrno};
 use mountpoint_s3_fs::s3::Prefix;
+use mountpoint_s3_fs::data::CrtDataPlane;
 use mountpoint_s3_fs::{S3Filesystem, S3FilesystemConfig};
 use proptest::prelude::*;
 use proptest_derive::Arbitrary;
@@ -189,7 +190,7 @@ pub struct Harness {
     /// Reference model for the system under test (SUT) to be compared against.
     reference: Reference,
     /// The system under test (SUT) that we compare against the [Self::reference].
-    fs: S3Filesystem<Arc<MockClient>>,
+    fs: S3Filesystem<CrtDataPlane<Arc<MockClient>>>,
     /// An S3 client, used for performing operations against the 'remote' S3.
     client: Arc<MockClient>,
     bucket: String,
@@ -199,7 +200,7 @@ pub struct Harness {
 impl Harness {
     /// Create a new test harness
     pub fn new(
-        fs: S3Filesystem<Arc<MockClient>>,
+        fs: S3Filesystem<CrtDataPlane<Arc<MockClient>>>,
         client: Arc<MockClient>,
         reference: Reference,
         bucket: &str,

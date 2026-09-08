@@ -27,6 +27,7 @@ use mountpoint_s3_fs::fs::error_metadata::{ErrorMetadata, MOUNTPOINT_ERROR_CLIEN
 use mountpoint_s3_fs::fs::{CacheConfig, FUSE_ROOT_INODE, OpenFlags, RenameFlags, TimeToLive, ToErrno};
 use mountpoint_s3_fs::memory::{CandidateSize, PagedPool};
 use mountpoint_s3_fs::s3::{Prefix, S3Personality};
+use mountpoint_s3_fs::data::CrtDataPlane;
 use mountpoint_s3_fs::{S3Filesystem, S3FilesystemConfig};
 use nix::unistd::{getgid, getuid};
 use rand::rngs::SmallRng;
@@ -1629,7 +1630,7 @@ async fn test_lookup_forbidden() {
     );
 }
 
-async fn new_local_file(fs: &S3Filesystem<Arc<MockClient>>, filename: &str) {
+async fn new_local_file(fs: &S3Filesystem<CrtDataPlane<Arc<MockClient>>>, filename: &str) {
     let mode = libc::S_IFREG | libc::S_IRWXU; // regular file + 0700 permissions
     let dentry = fs.mknod(FUSE_ROOT_INODE, filename.as_ref(), mode, 0, 0).await.unwrap();
     assert_eq!(dentry.attr.size, 0);
@@ -1644,7 +1645,7 @@ async fn new_local_file(fs: &S3Filesystem<Arc<MockClient>>, filename: &str) {
 }
 
 async fn ls(
-    fs: &S3Filesystem<Arc<MockClient>>,
+    fs: &S3Filesystem<CrtDataPlane<Arc<MockClient>>>,
     dir_handle: u64,
     offset: i64,
     max_entries: usize,

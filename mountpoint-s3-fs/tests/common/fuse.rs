@@ -17,6 +17,7 @@ use mountpoint_s3_fs::manifest::{Manifest, ManifestMetablock};
 use mountpoint_s3_fs::memory::{CandidateSize, MINIMUM_MEM_LIMIT, PagedPool};
 use mountpoint_s3_fs::prefetch::PrefetcherBuilder;
 use mountpoint_s3_fs::s3::{Prefix, S3Path};
+use mountpoint_s3_fs::data::CrtDataPlane;
 use mountpoint_s3_fs::{Runtime, S3Filesystem, S3FilesystemConfig, Superblock, SuperblockConfig};
 use nix::fcntl::{self, FdFlag};
 use tempfile::TempDir;
@@ -209,7 +210,7 @@ fn create_filesystem<Client>(
     s3_path: S3Path,
     filesystem_config: S3FilesystemConfig,
     #[cfg(feature = "manifest")] manifest: Option<Manifest>,
-) -> S3Filesystem<Client>
+) -> S3Filesystem<CrtDataPlane<Client>>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {

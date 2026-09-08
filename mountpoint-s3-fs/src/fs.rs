@@ -12,8 +12,6 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tracing::{Level, debug, trace};
 
-use std::marker::PhantomData;
-
 use crate::async_util::Runtime;
 use crate::data::{CrtDataPlane, DataPlane, Reader, Segments};
 use crate::logging;
@@ -54,22 +52,15 @@ pub const FUSE_ROOT_INODE: InodeNo = 1u64;
 
 /// The filesystem, parameterized over the [`DataPlane`] that moves object bytes.
 ///
-/// `DP` defaults to [`CrtDataPlane`], the CRT-backed prefetcher/uploader, so `S3Filesystem<Client>`
-/// still names the production filesystem. `Client` is retained because the default backend is built
-/// from an [`ObjectClient`] (and its `write_part_size` sizes the write-handle limiter); it is not
-/// otherwise stored, hence the `PhantomData`.
-pub struct S3Filesystem<Client, DP = CrtDataPlane<Client>>
-where
-    Client: ObjectClient + Clone + Send + Sync + 'static,
-    DP: DataPlane,
-{
+/// Build it with [`new`](Self::new) for the default CRT-backed prefetcher/uploader, or
+/// [`new_with_data_plane`](Self::new_with_data_plane) for any other backend.
+pub struct S3Filesystem<DP: DataPlane> {
     config: S3FilesystemConfig,
     metablock: Arc<dyn Metablock>,
     data_plane: DP,
     write_handle_limiter: Option<WriteHandleLimiter>,
     next_handle: AtomicU64,
     file_handles: AsyncRwLock<HashMap<u64, Arc<FileHandle<DP>>>>,
-    _phantom: PhantomData<Client>,
 }
 
 /// Reply to a `lookup` call
@@ -148,7 +139,7 @@ impl Default for StatFs {
     }
 }
 
-impl<Client> S3Filesystem<Client, CrtDataPlane<Client>>
+impl<Client> S3Filesystem<CrtDataPlane<Client>>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
@@ -182,11 +173,7 @@ where
     }
 }
 
-impl<Client, DP> S3Filesystem<Client, DP>
-where
-    Client: ObjectClient + Clone + Send + Sync + 'static,
-    DP: DataPlane + 'static,
-{
+impl<DP: DataPlane + 'static> S3Filesystem<DP> {
     /// Build a filesystem on an arbitrary [`DataPlane`].
     ///
     /// `write_part_size` sizes the write-handle limiter and comes from whatever produced the data
@@ -208,7 +195,6 @@ where
             write_handle_limiter,
             next_handle: AtomicU64::new(1),
             file_handles: AsyncRwLock::new(HashMap::new()),
-            _phantom: PhantomData,
         }
     }
 
@@ -1125,7 +1111,7 @@ mod tests {
             .expect("re-open for a released file should succeed");
     }
 
-    async fn setup_file(test_name: &str, fs: &S3Filesystem<MockClient>) -> Entry {
+    async fn setup_file(test_name: &str, fs: &S3Filesystem<CrtDataPlane<MockClient>>) -> Entry {
         // Lookup inode of the dir1 directory
         let entry = fs.lookup(FUSE_ROOT_INODE, "dir1".as_ref()).await.unwrap();
         assert_eq!(entry.attr.kind, FileType::Directory);
@@ -1146,7 +1132,7 @@ mod tests {
         dentry
     }
 
-    fn setup_mock_fs(test_name: &str, allow_overwrite: bool, incremental_upload: bool) -> S3Filesystem<MockClient> {
+    fn setup_mock_fs(test_name: &str, allow_overwrite: bool, incremental_upload: bool) -> S3Filesystem<CrtDataPlane<MockClient>> {
         setup_mock_fs_with_config(
             test_name,
             S3FilesystemConfig {
@@ -1157,7 +1143,7 @@ mod tests {
         )
     }
 
-    fn setup_mock_fs_with_config(test_name: &str, fs_config: S3FilesystemConfig) -> S3Filesystem<MockClient> {
+    fn setup_mock_fs_with_config(test_name: &str, fs_config: S3FilesystemConfig) -> S3Filesystem<CrtDataPlane<MockClient>> {
         let bucket = Bucket::new("bucket").unwrap();
         let client = MockClient::config()
             .bucket(bucket.to_string())
@@ -1202,7 +1188,7 @@ mod tests {
         assert_eq!(fs.write_handle_limiter.is_some(), expect_limiter);
     }
 
-    fn setup_read_only_fs(test_name: &str) -> S3Filesystem<MockClient> {
+    fn setup_read_only_fs(test_name: &str) -> S3Filesystem<CrtDataPlane<MockClient>> {
         setup_mock_fs_with_config(
             test_name,
             S3FilesystemConfig {
@@ -1215,7 +1201,7 @@ mod tests {
     }
 
     /// Resolve `dir1` and the object inside it that `setup_mock_fs_with_config` creates.
-    async fn lookup_dir_and_file(test_name: &str, fs: &S3Filesystem<MockClient>) -> (InodeNo, InodeNo) {
+    async fn lookup_dir_and_file(test_name: &str, fs: &S3Filesystem<CrtDataPlane<MockClient>>) -> (InodeNo, InodeNo) {
         let dir_ino = fs.lookup(FUSE_ROOT_INODE, "dir1".as_ref()).await.unwrap().attr.ino;
         let file_ino = fs
             .lookup(dir_ino, format!("{test_name}1.txt").as_ref())

@@ -12,6 +12,7 @@ use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use mountpoint_s3_fs::S3Filesystem;
+use mountpoint_s3_fs::data::CrtDataPlane;
 use mountpoint_s3_fs::memory::{CandidateSize, PagedPool};
 use test_case::test_case;
 
@@ -207,7 +208,7 @@ async fn test_read_unhandled_error_mock() {
     );
 }
 
-async fn create_fs_with_mock_s3(bucket: &str) -> (S3Filesystem<S3CrtClient>, MockServer) {
+async fn create_fs_with_mock_s3(bucket: &str) -> (S3Filesystem<CrtDataPlane<S3CrtClient>>, MockServer) {
     let server = MockServer::start().await;
     let endpoint = server.uri();
     let endpoint = Uri::new_from_str(&Allocator::default(), endpoint).expect("must be a valid uri");
