@@ -11,10 +11,11 @@
 //! One trait over both lets a single benchmark binary run the same workload against either
 //! backend and compare the results.
 //!
-//! **Experimental, and used only by the `s3io_benchmark` example.** The RTM dependency is
-//! optional and gated behind the `rtm_data_plane` feature, which the `mountpoint-s3` binary
-//! does not enable, so nothing here reaches a release build. Nothing in `fs.rs` uses this
-//! module.
+//! [`CrtDataPlane`] is always compiled and is the default backend the filesystem
+//! ([`S3Filesystem`](crate::fs::S3Filesystem)) runs on, so this module is on the mount path. The
+//! RTM backend and its dependency are optional and gated behind the `rtm_data_plane` feature, which
+//! the `mountpoint-s3` binary does not enable by default; it is selectable at mount time and remains
+//! experimental (notably, RTM reads perform no CRC validation).
 
 pub mod segments;
 
@@ -44,6 +45,9 @@ pub use writer::{RtmWriter, WriteResult, WriterConfig};
 
 pub use crt_adapter::CrtDataPlane;
 
+use mountpoint_s3_client::types::ETag;
+
+use crate::fs::error_metadata::ErrorMetadata;
 use crate::{object::ObjectId, s3::Bucket};
 
 /// Identifies the exact bytes a read is against.
@@ -88,18 +92,29 @@ pub enum ReadError {
     /// The object changed underneath us — `if_match` failed. Distinct from a transport
     /// error because the correct response differs: re-open at the new version rather than
     /// retry.
+    ///
+    /// Carries [`ErrorMetadata`] so the S3 error code, HTTP status, bucket, and key survive to the
+    /// FUSE reply's crash keys and event log rather than being flattened away.
     #[error("object was modified during read (etag mismatch)")]
-    ObjectModified,
+    ObjectModified { metadata: Box<ErrorMetadata> },
 
     /// A part arrived at an offset other than the one requested. Cheap to check and
     /// catastrophic to miss, so it is checked.
     #[error("expected data at offset {expected}, got {actual}")]
     OffsetMismatch { expected: u64, actual: u64 },
 
-    /// The transfer layer failed. Boxed to keep this enum substrate-independent while
-    /// still preserving the source chain for diagnosability.
-    #[error("transfer failed: {0}")]
-    Transfer(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The transfer layer failed. The cause is boxed to keep this enum independent of any one
+    /// transfer layer; [`ErrorMetadata`] is carried alongside so S3 error metadata is not lost when
+    /// the concrete error type is erased. Backends without such metadata supply a default.
+    ///
+    /// The boxed error is `#[source]` rather than interpolated into the message, so an alternate
+    /// (`{:#}`) format walks the chain once instead of printing the immediate cause twice.
+    #[error("transfer failed")]
+    Transfer {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+        metadata: Box<ErrorMetadata>,
+    },
 
     /// The body ended before the requested range did, without an error.
     #[error("stream ended at offset {offset}, {short_by} bytes short")]
@@ -119,7 +134,9 @@ pub enum WriteError {
     ///
     /// An unknown-length upload that overruns the multipart ceiling (`part_size * 10,000`)
     /// surfaces here, mid-stream, since without a declared size it cannot be caught up front.
-    #[error("transfer failed: {0}")]
+    ///
+    /// `#[source]` rather than interpolated, for the same reason as [`ReadError::Transfer`].
+    #[error("transfer failed")]
     Transfer(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// The upload was already finished — completed or aborted — when this call arrived.
@@ -132,6 +149,14 @@ pub enum WriteError {
     /// has no way to append to an existing object.
     #[error("incremental/append upload is not supported by this backend")]
     IncrementalUnsupported,
+
+    /// The object grew past the maximum size the backend can upload.
+    ///
+    /// Carried as its own variant rather than folded into [`Transfer`](Self::Transfer) so a caller
+    /// can map it to `EFBIG`/`ENOSPC` — the errno an `fsync` is required to report for a
+    /// space-related failure — instead of an opaque `EIO`.
+    #[error("object exceeded the maximum upload size of {max} bytes")]
+    TooBig { max: u64 },
 }
 
 /// Per-reader counters, for diagnostics and for comparing backends: request and cursor
@@ -181,6 +206,13 @@ pub struct WriteSpec {
     /// Append to an existing object rather than replacing it. Only some backends support this —
     /// [`DataPlane::open_write`] returns [`WriteError::IncrementalUnsupported`] on those that do not.
     pub incremental: bool,
+    /// The offset the first write will arrive at. Zero for a whole-object write or an append that
+    /// starts from an empty object; the existing object's size for an append that extends it.
+    pub initial_offset: u64,
+    /// The etag to guard the append against with `if_match`, so a concurrent overwrite fails the
+    /// upload rather than appending to a different version. `None` for a whole-object write or an
+    /// append to an object that does not yet exist. Only consulted on the incremental path.
+    pub initial_etag: Option<ETag>,
 }
 
 impl WriteSpec {
@@ -190,15 +222,37 @@ impl WriteSpec {
             bucket: bucket.into(),
             key: key.into(),
             incremental: false,
+            initial_offset: 0,
+            initial_etag: None,
         }
     }
 
-    /// An incremental (append) write. Not every backend supports it (see [`WriteSpec::incremental`]).
+    /// An incremental (append) write starting from an empty object. Not every backend supports it
+    /// (see [`WriteSpec::incremental`]).
     pub fn incremental(bucket: impl Into<String>, key: impl Into<String>) -> Self {
         Self {
             bucket: bucket.into(),
             key: key.into(),
             incremental: true,
+            initial_offset: 0,
+            initial_etag: None,
+        }
+    }
+
+    /// An incremental (append) write extending an existing object from `initial_offset`, guarded by
+    /// `initial_etag`. Not every backend supports it (see [`WriteSpec::incremental`]).
+    pub fn incremental_at(
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        initial_offset: u64,
+        initial_etag: Option<ETag>,
+    ) -> Self {
+        Self {
+            bucket: bucket.into(),
+            key: key.into(),
+            incremental: true,
+            initial_offset,
+            initial_etag,
         }
     }
 }

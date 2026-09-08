@@ -17,6 +17,7 @@
 use std::sync::Mutex;
 
 use mountpoint_s3_client::ObjectClient;
+use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 
 use crate::sync::AsyncMutex;
 
@@ -24,8 +25,65 @@ use crate::data::{
     DataPlane, ObjectSpec, ReadError, Reader, ReaderStats, Segments, WriteError, WriteOutcome, WriteSpec, Writer,
     WriterStats,
 };
-use crate::prefetch::{PrefetchGetObject, Prefetcher};
-use crate::upload::{AppendUploadRequest, UploadRequest, Uploader};
+use crate::fs::error_metadata::ErrorMetadata;
+use crate::prefetch::{PrefetchGetObject, PrefetchReadError, Prefetcher};
+use crate::upload::{AppendUploadRequest, UploadError, UploadRequest, Uploader};
+
+/// Map a CRT [`PrefetchReadError`] to the substrate-independent [`ReadError`].
+///
+/// A precondition failure is surfaced as [`ReadError::ObjectModified`] rather than boxed into
+/// [`ReadError::Transfer`], so the caller can map it to `ESTALE` (re-open at the new version) rather
+/// than a generic `EIO`. Everything else stays a [`Transfer`](ReadError::Transfer). Either way the
+/// prefetcher's [`ErrorMetadata`] (S3 error code, HTTP status, bucket, key) is carried through, so it
+/// still reaches the FUSE reply's crash keys and event log.
+fn read_error<E>(err: PrefetchReadError<E>) -> ReadError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match err {
+        PrefetchReadError::GetRequestFailed { source, metadata } => {
+            if matches!(
+                source,
+                ObjectClientError::ServiceError(GetObjectError::PreconditionFailed(_))
+            ) {
+                ReadError::ObjectModified { metadata }
+            } else {
+                ReadError::Transfer {
+                    source: Box::new(source),
+                    metadata,
+                }
+            }
+        }
+        other => ReadError::Transfer {
+            source: Box::new(other),
+            metadata: Box::new(ErrorMetadata::default()),
+        },
+    }
+}
+
+/// Map a CRT [`UploadError`] to the substrate-independent [`WriteError`].
+///
+/// [`ObjectTooBig`](UploadError::ObjectTooBig) becomes [`WriteError::TooBig`] and an out-of-order
+/// write keeps its typed variant, so both survive as the errno the caller expects (`EFBIG`,
+/// `EINVAL`); anything else is boxed into [`Transfer`](WriteError::Transfer).
+fn write_error<E>(err: UploadError<E>) -> WriteError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match err {
+        UploadError::ObjectTooBig { maximum_size } => WriteError::TooBig {
+            max: maximum_size as u64,
+        },
+        UploadError::OutOfOrderWrite {
+            write_offset,
+            expected_offset,
+        } => WriteError::OutOfOrderWrite {
+            write_offset,
+            expected_offset,
+        },
+        other => WriteError::Transfer(Box::new(other)),
+    }
+}
 
 /// [`DataPlane`] over the existing CRT [`Prefetcher`] (reads) and [`Uploader`] (writes).
 pub struct CrtDataPlane<Client>
@@ -42,6 +100,11 @@ where
 {
     pub fn new(prefetcher: Prefetcher<Client>, uploader: Uploader<Client>) -> Self {
         Self { prefetcher, uploader }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_sse(&mut self, sse_type: Option<String>, sse_kms_key_id: Option<String>) {
+        self.uploader.corrupt_sse(sse_type, sse_kms_key_id)
     }
 }
 
@@ -66,13 +129,17 @@ where
     fn open_write(&self, spec: WriteSpec) -> Result<Self::Writer, WriteError> {
         if spec.incremental {
             // Append: PutObject-with-offset per buffer, driven by the uploader's incremental queue.
-            let request = self.uploader.start_incremental_upload(spec.bucket, spec.key, 0, None);
+            // `initial_offset`/`initial_etag` position and guard the append; for an append from an
+            // empty object they are 0/None.
+            let request =
+                self.uploader
+                    .start_incremental_upload(spec.bucket, spec.key, spec.initial_offset, spec.initial_etag);
             Ok(CrtWriter::Incremental { request, bytes: 0 })
         } else {
             let request = self
                 .uploader
                 .start_atomic_upload(spec.bucket, spec.key)
-                .map_err(|e| WriteError::Transfer(Box::new(e)))?;
+                .map_err(write_error)?;
             Ok(CrtWriter::Atomic { request, bytes: 0 })
         }
     }
@@ -132,7 +199,10 @@ where
         match result {
             Ok(checksummed) => {
                 // Validates CRC32C over every byte. See the module note on fairness.
-                let bytes = checksummed.into_bytes().map_err(|e| ReadError::Transfer(Box::new(e)))?;
+                let bytes = checksummed.into_bytes().map_err(|e| ReadError::Transfer {
+                    source: Box::new(e),
+                    metadata: Box::new(ErrorMetadata::default()),
+                })?;
                 let mut stats = self.stats.lock().expect("stats lock poisoned");
                 stats.bytes_delivered += bytes.len() as u64;
                 // The prefetcher does not expose bytes actually fetched from S3, so
@@ -142,7 +212,7 @@ where
                 stats.bytes_fetched += bytes.len() as u64;
                 Ok(Segments::from(bytes))
             }
-            Err(e) => Err(ReadError::Transfer(Box::new(e))),
+            Err(e) => Err(read_error(e)),
         }
     }
 
@@ -177,18 +247,12 @@ where
             // Atomic `write` takes an `i64` offset; incremental takes `u64`. Both are strictly
             // sequential and surface an out-of-order write as `UploadError::OutOfOrderWrite`.
             CrtWriter::Atomic { request, bytes } => {
-                let n = request
-                    .write(offset as i64, data)
-                    .await
-                    .map_err(|e| WriteError::Transfer(Box::new(e)))?;
+                let n = request.write(offset as i64, data).await.map_err(write_error)?;
                 *bytes += n as u64;
                 n
             }
             CrtWriter::Incremental { request, bytes } => {
-                let n = request
-                    .write(offset, data)
-                    .await
-                    .map_err(|e| WriteError::Transfer(Box::new(e)))?;
+                let n = request.write(offset, data).await.map_err(write_error)?;
                 *bytes += n as u64;
                 n
             }
@@ -199,10 +263,7 @@ where
     async fn complete(self) -> Result<WriteOutcome, WriteError> {
         match self {
             CrtWriter::Atomic { request, bytes } => {
-                let result = request
-                    .complete()
-                    .await
-                    .map_err(|e| WriteError::Transfer(Box::new(e)))?;
+                let result = request.complete().await.map_err(write_error)?;
                 Ok(WriteOutcome {
                     etag: Some(result.etag.as_str().to_owned()),
                     size: bytes,
@@ -211,10 +272,7 @@ where
             }
             CrtWriter::Incremental { request, bytes } => {
                 // `None` when no PUT was ever issued (an empty upload).
-                let result = request
-                    .complete()
-                    .await
-                    .map_err(|e| WriteError::Transfer(Box::new(e)))?;
+                let result = request.complete().await.map_err(write_error)?;
                 Ok(WriteOutcome {
                     etag: result.map(|r| r.etag.as_str().to_owned()),
                     size: bytes,

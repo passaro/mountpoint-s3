@@ -3,6 +3,7 @@
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use tracing::Level;
 
+use crate::data::{ReadError, WriteError};
 use crate::fs::error_metadata::ErrorMetadata;
 use crate::metablock::InodeError;
 use crate::prefetch::PrefetchReadError;
@@ -140,6 +141,58 @@ impl<E: std::error::Error + Send + Sync + 'static> From<PrefetchReadError<E>> fo
             | PrefetchReadError::ReadWindowIncrement => {
                 err!(libc::EIO, source:err, "get request failed")
             }
+        }
+    }
+}
+
+impl From<ReadError> for Error {
+    fn from(err: ReadError) -> Self {
+        // Carry through the S3 error metadata the backend attached (bucket, key, HTTP status, S3
+        // error code), so crash keys and the event log stay populated as they did before the read
+        // path went through the data plane.
+        let metadata = match &err {
+            ReadError::ObjectModified { metadata } | ReadError::Transfer { metadata, .. } => metadata.clone(),
+            _ => Box::default(),
+        };
+        let (errno, message) = match &err {
+            // The object changed under us (`if_match` failed): tell the kernel to re-open, matching
+            // the `PreconditionFailed` -> `ESTALE` mapping on the direct prefetch path above.
+            ReadError::ObjectModified { .. } => (libc::ESTALE, "object was mutated remotely"),
+            // A read at or past EOF; `read_at` clamps a range that only runs past the end, so this
+            // is the genuinely-out-of-bounds case.
+            ReadError::OutOfRange { .. } => (libc::EINVAL, "read past end of object"),
+            ReadError::OffsetMismatch { .. } | ReadError::Transfer { .. } | ReadError::UnexpectedEof { .. } => {
+                (libc::EIO, "read failed")
+            }
+        };
+        // `ObjectModified` is a restatement with no distinct cause, so it carries no source (matching
+        // the prefetch path); the others chain the underlying error for diagnosability.
+        let source = match &err {
+            ReadError::ObjectModified { .. } => None,
+            _ => Some(anyhow::anyhow!(err)),
+        };
+        Error {
+            errno,
+            message: message.to_string(),
+            source,
+            level: Level::WARN,
+            metadata,
+        }
+    }
+}
+
+impl From<WriteError> for Error {
+    fn from(err: WriteError) -> Self {
+        match err {
+            // Mountpoint only supports sequential writes, same as `UploadError::OutOfOrderWrite`.
+            WriteError::OutOfOrderWrite { .. } => err!(libc::EINVAL, source:err, "out-of-order write"),
+            // The backend cannot express append; refuse the open cleanly rather than degrade.
+            WriteError::IncrementalUnsupported => {
+                err!(libc::EOPNOTSUPP, source:err, "append upload not supported by this backend")
+            }
+            // `EFBIG` so `fsync` can remap it to `ENOSPC` (see `fs::fsync`).
+            WriteError::TooBig { .. } => err!(libc::EFBIG, source:err, "object too big"),
+            WriteError::NotInProgress | WriteError::Transfer(_) => err!(libc::EIO, source:err, "write failed"),
         }
     }
 }
