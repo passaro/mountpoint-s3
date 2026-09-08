@@ -1,9 +1,8 @@
 //! Links _fuser_ method calls into Mountpoint's filesystem code in [crate::fs].
 
 use futures::executor::block_on;
-use mountpoint_s3_client::ObjectClient;
 
-use crate::data::{CrtDataPlane, DataPlane};
+use crate::data::DataPlane;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::time::SystemTime;
@@ -82,30 +81,18 @@ macro_rules! fuse_unsupported {
 
 /// This is just a thin wrapper around [S3Filesystem] that implements the actual `fuser` protocol,
 /// so that we can test our actual filesystem implementation without having actual FUSE in the loop.
-pub struct S3FuseFilesystem<Client, DP = CrtDataPlane<Client>>
-where
-    Client: ObjectClient + Clone + Send + Sync + 'static,
-    DP: DataPlane,
-{
-    fs: S3Filesystem<Client, DP>,
+pub struct S3FuseFilesystem<DP: DataPlane> {
+    fs: S3Filesystem<DP>,
     error_logger: Option<Box<dyn ErrorLogger + Send + Sync>>,
 }
 
-impl<Client, DP> S3FuseFilesystem<Client, DP>
-where
-    Client: ObjectClient + Clone + Send + Sync + 'static,
-    DP: DataPlane,
-{
-    pub fn new(fs: S3Filesystem<Client, DP>, error_logger: Option<Box<dyn ErrorLogger + Send + Sync>>) -> Self {
+impl<DP: DataPlane> S3FuseFilesystem<DP> {
+    pub fn new(fs: S3Filesystem<DP>, error_logger: Option<Box<dyn ErrorLogger + Send + Sync>>) -> Self {
         Self { fs, error_logger }
     }
 }
 
-impl<Client, DP> Filesystem for S3FuseFilesystem<Client, DP>
-where
-    Client: ObjectClient + Clone + Send + Sync + 'static,
-    DP: DataPlane + 'static,
-{
+impl<DP: DataPlane + 'static> Filesystem for S3FuseFilesystem<DP> {
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), pid=_req.pid()))]
     fn init(&self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
         if let Some(error_logger) = self.error_logger.as_ref() {

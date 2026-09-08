@@ -126,9 +126,7 @@ impl MountpointConfig {
             #[cfg(feature = "rtm_data_plane")]
             DataPlaneKind::Rtm(rtm_config) => {
                 let (data_plane, write_part_size) = build_rtm_data_plane(&rtm_config)?;
-                // `Client` here is only the phantom type parameter; the RTM plane carries its own
-                // transfer-manager client and does not use it.
-                let fs = S3Filesystem::<Client, _>::new_with_data_plane(
+                let fs = S3Filesystem::new_with_data_plane(
                     data_plane,
                     write_part_size,
                     memory_pool,

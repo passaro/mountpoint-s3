@@ -30,6 +30,7 @@ use mountpoint_s3_fs::memory::{CandidateSize, PagedPool};
 use mountpoint_s3_fs::metrics::metrics_tracing_span_layer;
 use mountpoint_s3_fs::prefetch::Prefetcher;
 use mountpoint_s3_fs::s3::{Bucket, Prefix, S3Path};
+use mountpoint_s3_fs::data::CrtDataPlane;
 use mountpoint_s3_fs::{Runtime, S3Filesystem, S3FilesystemConfig, Superblock, SuperblockConfig};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -42,7 +43,7 @@ pub fn make_test_filesystem(
     bucket: &str,
     prefix: &Prefix,
     config: S3FilesystemConfig,
-) -> (Arc<MockClient>, S3Filesystem<Arc<MockClient>>) {
+) -> (Arc<MockClient>, S3Filesystem<CrtDataPlane<Arc<MockClient>>>) {
     let part_size = 1024 * 1024;
     let client = Arc::new(
         MockClient::config()
@@ -66,7 +67,7 @@ pub fn make_test_filesystem_with_client<Client>(
     bucket: &str,
     prefix: &Prefix,
     config: S3FilesystemConfig,
-) -> S3Filesystem<Client>
+) -> S3Filesystem<CrtDataPlane<Client>>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {

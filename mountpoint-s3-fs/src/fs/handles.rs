@@ -1,6 +1,5 @@
 use std::str::FromStr as _;
 
-use mountpoint_s3_client::ObjectClient;
 use mountpoint_s3_client::types::ETag;
 use tracing::{debug, error};
 
@@ -67,16 +66,13 @@ impl<DP: DataPlane> std::fmt::Debug for FileHandleState<DP> {
 }
 
 impl<DP: DataPlane> FileHandleState<DP> {
-    pub async fn new<Client>(
+    pub async fn new(
         mode: ReadWriteMode,
         lookup: &Lookup,
         write_slot: Option<WriteHandleSlot>,
         flags: OpenFlags,
-        fs: &S3Filesystem<Client, DP>,
-    ) -> Result<FileHandleState<DP>, Error>
-    where
-        Client: ObjectClient + Clone + Send + Sync + 'static,
-    {
+        fs: &S3Filesystem<DP>,
+    ) -> Result<FileHandleState<DP>, Error> {
         let ino = lookup.ino();
         let stat = lookup.stat();
         let location = lookup.s3_location()?;
@@ -189,17 +185,14 @@ impl<DP: DataPlane> std::fmt::Debug for UploadState<DP> {
 }
 
 impl<DP: DataPlane + 'static> UploadState<DP> {
-    pub async fn write<Client>(
+    pub async fn write(
         &mut self,
-        fs: &S3Filesystem<Client, DP>,
+        fs: &S3Filesystem<DP>,
         handle: &FileHandle<DP>,
         offset: i64,
         data: &[u8],
         fh: u64,
-    ) -> Result<u32, Error>
-    where
-        Client: ObjectClient + Clone + Send + Sync + 'static,
-    {
+    ) -> Result<u32, Error> {
         // Borrow the writer only for the duration of the transfer; the await yields an owned
         // `Result`, releasing the borrow so the error path below can take the writer out to abort it.
         let result = match self {
@@ -245,15 +238,7 @@ impl<DP: DataPlane + 'static> UploadState<DP> {
     /// Commit data to S3 and mark the upload as completed. In case it is an append request, finalize
     /// the current data and start a new request at the new offset and etag so the handle stays
     /// writable.
-    pub async fn commit<Client>(
-        &mut self,
-        fs: &S3Filesystem<Client, DP>,
-        handle: Arc<FileHandle<DP>>,
-        fh: u64,
-    ) -> Result<(), Error>
-    where
-        Client: ObjectClient + Clone + Send + Sync + 'static,
-    {
+    pub async fn commit(&mut self, fs: &S3Filesystem<DP>, handle: Arc<FileHandle<DP>>, fh: u64) -> Result<(), Error> {
         match self {
             UploadState::Completed => return Ok(()),
             UploadState::Failed(e) => {
@@ -321,16 +306,14 @@ impl<DP: DataPlane + 'static> UploadState<DP> {
     /// Commit any buffered data (if written by the opener-process) to S3, and mark the upload as
     /// completed. In case there is no data written, or if it is written by a different process,
     /// don't complete the upload but mark the handle as flushed.
-    pub async fn complete<Client>(
+    pub async fn complete(
         &mut self,
-        fs: &S3Filesystem<Client, DP>,
+        fs: &S3Filesystem<DP>,
         handle: Arc<FileHandle<DP>>,
         pid: u32,
         open_pid: u32,
         fh: u64,
     ) -> Result<(), Error>
-    where
-        Client: ObjectClient + Clone + Send + Sync + 'static,
     {
         let (incremental, written_bytes) = match self {
             UploadState::InProgress {
@@ -447,15 +430,7 @@ impl<DP: DataPlane + 'static> UploadState<DP> {
     /// Mark the write-handle as deactivated in the inode's handle_map entry, and attach a
     /// PendingUploadHook to the inode for a future release/open to complete the delayed upload
     /// and clean up the writer.
-    async fn flush_writer<Client>(
-        fs: &S3Filesystem<Client, DP>,
-        ino: InodeNo,
-        handle: Arc<FileHandle<DP>>,
-        fh: u64,
-    ) -> Result<(), Error>
-    where
-        Client: ObjectClient + Clone + Send + Sync + 'static,
-    {
+    async fn flush_writer(fs: &S3Filesystem<DP>, ino: InodeNo, handle: Arc<FileHandle<DP>>, fh: u64) -> Result<(), Error> {
         let pending_upload_hook = PendingUploadHook::new(fs.metablock.clone(), handle, fh);
         fs.metablock.flush_writer(ino, fh, pending_upload_hook).await?;
         Ok(())
