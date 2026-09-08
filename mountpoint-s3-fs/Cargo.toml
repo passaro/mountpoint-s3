@@ -21,6 +21,11 @@ mountpoint-s3-client = { workspace = true }
 aws-sdk-s3-transfer-manager = { git = "https://github.com/awslabs/aws-s3-transfer-manager-rs.git", rev = "ccc8d95", optional = true }
 # Runtime-agnostic timer the RTM writer uses to notice a failed upload while stalled on a handoff.
 async-io = { version = "2.6.0", optional = true }
+# Standing up the RTM transfer manager at mount time needs an SDK client and credential/region
+# loading. Optional and gated behind `rtm_data_plane`; also dev-dependencies, so tests/examples get
+# them without the feature.
+aws-config = { version = "1.8.18", optional = true }
+aws-sdk-s3 = { version = "1.137.0", default-features = false, features = ["behavior-version-latest", "sigv4a", "rt-tokio", "default-https-client"], optional = true }
 
 anyhow = { version = "1.0.103", features = ["backtrace"] }
 async-channel = "2.5.0"
@@ -104,7 +109,7 @@ wiremock = "0.6.5"
 block_size = []
 event_log = []
 # Experimental RTM-backed data plane (mountpoint-s3-fs::data). Example/test use only.
-rtm_data_plane = ["aws-sdk-s3-transfer-manager", "async-io"]
+rtm_data_plane = ["dep:aws-sdk-s3-transfer-manager", "dep:async-io", "dep:aws-config", "dep:aws-sdk-s3"]
 # Use alternative configuration for jemalloc.
 jemalloc_conf = []
 manifest = ["csv", "rusqlite"]
