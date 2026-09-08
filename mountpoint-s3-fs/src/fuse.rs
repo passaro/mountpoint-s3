@@ -2,6 +2,8 @@
 
 use futures::executor::block_on;
 use mountpoint_s3_client::ObjectClient;
+
+use crate::data::{CrtDataPlane, DataPlane};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::time::SystemTime;
@@ -80,26 +82,29 @@ macro_rules! fuse_unsupported {
 
 /// This is just a thin wrapper around [S3Filesystem] that implements the actual `fuser` protocol,
 /// so that we can test our actual filesystem implementation without having actual FUSE in the loop.
-pub struct S3FuseFilesystem<Client>
+pub struct S3FuseFilesystem<Client, DP = CrtDataPlane<Client>>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
+    DP: DataPlane,
 {
-    fs: S3Filesystem<Client>,
+    fs: S3Filesystem<Client, DP>,
     error_logger: Option<Box<dyn ErrorLogger + Send + Sync>>,
 }
 
-impl<Client> S3FuseFilesystem<Client>
+impl<Client, DP> S3FuseFilesystem<Client, DP>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
+    DP: DataPlane,
 {
-    pub fn new(fs: S3Filesystem<Client>, error_logger: Option<Box<dyn ErrorLogger + Send + Sync>>) -> Self {
+    pub fn new(fs: S3Filesystem<Client, DP>, error_logger: Option<Box<dyn ErrorLogger + Send + Sync>>) -> Self {
         Self { fs, error_logger }
     }
 }
 
-impl<Client> Filesystem for S3FuseFilesystem<Client>
+impl<Client, DP> Filesystem for S3FuseFilesystem<Client, DP>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
+    DP: DataPlane + 'static,
 {
     #[instrument(level="warn", skip_all, fields(req=_req.unique(), pid=_req.pid()))]
     fn init(&self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
@@ -160,12 +165,10 @@ where
         match block_on(self.fs.read(ino, fh, offset, size, flags, lock).in_current_span()) {
             Ok(data) => {
                 bytes_sent = data.len();
-                // FAKE (testing only): the read path still returns one contiguous `Bytes`, but to
-                // exercise the vectored reply with a realistic chunk count we split it into 8 KiB
-                // slices — mimicking the ~16 chunks/128 KiB the RTM `Segments` would deliver.
-                // The slices borrow `data` in place (no copy), so it must outlive this call.
-                let slices: Vec<_> = data.chunks(8 * 1024).collect();
-                reply.data_vectored(&slices);
+                // The data plane delivers a possibly-segmented run of bytes; reply with a vectored
+                // write over the chunks in place, so a non-contiguous `Segments` is not copied to
+                // satisfy FUSE.
+                reply.data_vectored(&data.io_slices());
             }
             Err(err) => fuse_error!("read", reply, err, self, req),
         }
