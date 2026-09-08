@@ -7,6 +7,7 @@ use crate::fs::error_metadata::{ErrorMetadata, MOUNTPOINT_ERROR_CLIENT, MOUNTPOI
 #[cfg(feature = "manifest")]
 use crate::manifest::ManifestError;
 use crate::memory::WriteHandleLimitError;
+use crate::data::WriteError;
 use crate::metablock::S3Location;
 use crate::sync::Arc;
 use crate::upload::UploadError;
@@ -127,6 +128,23 @@ impl InodeError {
     {
         let metadata = ErrorMetadata {
             client_error_meta: err.meta(),
+            error_code: Some(MOUNTPOINT_ERROR_CLIENT.to_string()),
+            s3_bucket_name: Some(key.bucket_name().to_string()),
+            s3_object_key: Some(key.full_key().to_string()),
+        };
+        let metadata = Box::new(metadata);
+        InodeError::ClientError {
+            source: Arc::new(anyhow!(err)),
+            metadata,
+        }
+    }
+
+    /// Like [`upload_error`](Self::upload_error) but for a data-plane [`WriteError`], which carries no
+    /// [`ProvideErrorMetadata`]. Bucket and key are still recorded; the client-level metadata is
+    /// empty, matching what the boxed transfer error can supply.
+    pub fn write_error(err: WriteError, key: S3Location) -> Self {
+        let metadata = ErrorMetadata {
+            client_error_meta: Default::default(),
             error_code: Some(MOUNTPOINT_ERROR_CLIENT.to_string()),
             s3_bucket_name: Some(key.bucket_name().to_string()),
             s3_object_key: Some(key.full_key().to_string()),

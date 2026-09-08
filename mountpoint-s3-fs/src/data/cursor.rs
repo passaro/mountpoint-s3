@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::data::reader::RtmConfig;
 use crate::data::{ObjectSpec, ReadError, Segments, Urgency};
+use crate::fs::error_metadata::ErrorMetadata;
 use aws_sdk_s3_transfer_manager::operation::download::DownloadHandle;
 use aws_sdk_s3_transfer_manager::types::ReadAhead;
 use bytes::Bytes;
@@ -404,7 +405,10 @@ impl Cursor {
             .range(&header)
             .read_ahead(ReadAhead::Parts(read_ahead_parts))
             .initiate()
-            .map_err(|e| ReadError::Transfer(Box::new(e)))?;
+            .map_err(|e| ReadError::Transfer {
+                source: Box::new(e),
+                metadata: Box::new(ErrorMetadata::default()),
+            })?;
         handle
             .scheduling()
             .set_priority(config.priorities.priority_for(urgency));
@@ -508,7 +512,12 @@ impl Cursor {
                         }
                     }
                 }
-                Some(Err(e)) => return Err(ReadError::Transfer(Box::new(e))),
+                Some(Err(e)) => {
+                    return Err(ReadError::Transfer {
+                        source: Box::new(e),
+                        metadata: Box::new(ErrorMetadata::default()),
+                    });
+                }
                 Some(Ok(chunk)) => {
                     if let Some(start) = chunk
                         .metadata
