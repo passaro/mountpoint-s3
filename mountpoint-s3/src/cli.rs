@@ -400,6 +400,14 @@ store.\
     )]
     pub user_agent_prefix: Option<String>,
 
+    #[cfg(feature = "rtm_data_plane")]
+    #[clap(
+        long,
+        help = "Experimental: read and write object data through the AWS S3 Transfer Manager data plane instead of the CRT",
+        help_heading = ADVANCED_OPTIONS_HEADER,
+    )]
+    pub rtm: bool,
+
     #[clap(
         long,
         help = "Server-side encryption algorithm to use when uploading new objects",

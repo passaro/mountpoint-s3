@@ -14,6 +14,8 @@ use mountpoint_s3_fs::memory::{CandidateSize, PagedPool};
 use mountpoint_s3_fs::metrics::MetricsConfig;
 use mountpoint_s3_fs::s3::config::ClientConfig;
 use mountpoint_s3_fs::s3::{S3Path, S3Personality};
+#[cfg(feature = "rtm_data_plane")]
+use mountpoint_s3_fs::{DataPlaneKind, s3::config::MemoryLimitSetting};
 use mountpoint_s3_fs::{MountpointConfig, Runtime, Superblock, SuperblockConfig, metrics};
 use nix::sys::signal::Signal;
 use nix::unistd::ForkResult;
@@ -197,6 +199,15 @@ fn mount(args: CliArgs, client_builder: impl ClientBuilder) -> anyhow::Result<Fu
     let memory_limit = args.memory_limit_setting();
     let client_config = args.client_config(build_info::FULL_VERSION, memory_limit)?;
 
+    // Build the experimental RTM data plane, if requested, from the same client configuration used
+    // for the CRT client, so the two cannot diverge. Done before `client_config` is consumed below.
+    #[cfg(feature = "rtm_data_plane")]
+    let rtm_data_plane = if args.rtm {
+        Some(build_rtm_data_plane(&client_config, memory_limit)?)
+    } else {
+        None
+    };
+
     // Set up a paged memory pool with the validated read_size_bytes
     let pool = PagedPool::config()
         .with_candidate_sizes([
@@ -232,8 +243,13 @@ fn mount(args: CliArgs, client_builder: impl ClientBuilder) -> anyhow::Result<Fu
         },
     );
 
-    let mut fuse_session = MountpointConfig::new(fuse_session_config, filesystem_config, data_cache_config)?
-        .create_fuse_session(superblock, client, runtime, pool)?;
+    let mountpoint_config = MountpointConfig::new(fuse_session_config, filesystem_config, data_cache_config)?;
+    #[cfg(feature = "rtm_data_plane")]
+    let mountpoint_config = match rtm_data_plane {
+        Some(data_plane) => mountpoint_config.data_plane(DataPlaneKind::Rtm(data_plane)),
+        None => mountpoint_config,
+    };
+    let mut fuse_session = mountpoint_config.create_fuse_session(superblock, client, runtime, pool)?;
     tracing::info!("successfully mounted {} at {}", bucket_description, mount_point_path);
 
     if let Some(managed_cache_dir) = managed_cache_dir {
@@ -292,6 +308,71 @@ pub fn create_s3_client(
         personality.unwrap_or_else(|| S3Personality::infer_from_bucket(&s3_path.bucket, &client.endpoint_config()));
 
     Ok((client, runtime, s3_personality))
+}
+
+/// Build the experimental RTM data plane from the same [`ClientConfig`] used for the CRT client, so
+/// region, endpoint, part sizes, throughput, and memory budget match. The transfer manager is a
+/// separate SDK client stack; only the default and named-profile credential modes are supported.
+#[cfg(feature = "rtm_data_plane")]
+fn build_rtm_data_plane(
+    client_config: &ClientConfig,
+    memory_limit: MemoryLimitSetting,
+) -> anyhow::Result<mountpoint_s3_fs::data::RtmDataPlane> {
+    use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryBudgetConfig, MemoryConfig};
+    use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
+    use mountpoint_s3_client::config::S3ClientAuthConfig;
+    use mountpoint_s3_fs::data::{RtmConfig, RtmDataPlane};
+
+    let profile = match &client_config.auth_config {
+        S3ClientAuthConfig::Default => None,
+        S3ClientAuthConfig::Profile(name) => Some(name.clone()),
+        S3ClientAuthConfig::NoSigning => anyhow::bail!("--no-sign-request is not supported with --rtm"),
+        S3ClientAuthConfig::Provider(_) => anyhow::bail!("a custom credentials provider is not supported with --rtm"),
+    };
+    let region = client_config.region.as_str().to_owned();
+    let endpoint_url = client_config.endpoint_url.clone();
+    let read_part_size = client_config.part_config.read_size_bytes;
+    let write_part_size = client_config.part_config.write_size_bytes;
+    let throughput_gbps = client_config.throughput_target.value();
+
+    // `load` is async but `mount` is sync, so block on it.
+    let sdk_config = futures::executor::block_on(async move {
+        let mut loader =
+            aws_config::defaults(aws_config::BehaviorVersion::latest()).region(aws_config::Region::new(region));
+        if let Some(url) = endpoint_url {
+            loader = loader.endpoint_url(url);
+        }
+        if let Some(profile) = profile {
+            loader = loader.profile_name(profile);
+        }
+        loader.load().await
+    });
+    let s3 = aws_sdk_s3::Client::new(&sdk_config);
+
+    // One pool, shared by the transfer manager's downloads and the data plane's upload parts.
+    let pool = BufferPool::builder()
+        .memory_budget(MemoryBudgetConfig::Limit(memory_limit.bytes()))
+        .build()
+        .context("invalid memory limit for --rtm")?;
+    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(s3)
+        .part_size(PartSize::Target(read_part_size as u64))
+        .concurrency(ConcurrencyMode::TargetThroughput(
+            TargetThroughput::new_gigabits_per_sec(throughput_gbps.round().max(1.0) as u64),
+        ))
+        .memory(MemoryConfig::Explicit(pool))
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+
+    let rtm_config = RtmConfig {
+        writer: mountpoint_s3_fs::data::WriterConfig {
+            write_part_size,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    Ok(RtmDataPlane::new(tm, rtm_config))
 }
 
 fn setup_disk_cache_directory(cache_config: &mut DataCacheConfig) -> anyhow::Result<Option<ManagedCacheDir>> {

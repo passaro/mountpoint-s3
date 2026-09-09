@@ -10,6 +10,14 @@ default-run = "mount-s3"
 mountpoint-s3-fs = { workspace = true }
 mountpoint-s3-client = { workspace = true }
 
+# Building the experimental RTM data plane at mount time needs an SDK client, credential/region
+# loading, and the transfer manager. Optional and gated behind `rtm_data_plane`; also
+# dev-dependencies, so integration tests get aws-config/aws-sdk-s3 without the feature. The transfer
+# manager pin must match mountpoint-s3-fs's.
+aws-config = { version = "1.8.18", optional = true }
+aws-sdk-s3 = { version = "1.137.0", default-features = false, features = ["behavior-version-latest", "sigv4a", "rt-tokio", "default-https-client"], optional = true }
+aws-sdk-s3-transfer-manager = { git = "https://github.com/awslabs/aws-s3-transfer-manager-rs.git", rev = "ccc8d95", optional = true }
+
 anyhow = { version = "1.0.103", features = ["backtrace"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 const_format = "0.2.36"
@@ -49,6 +57,13 @@ built = { version = "0.8.1", features = ["git2"] }
 # Unreleased feature flags
 block_size = ["mountpoint-s3-fs/block_size"]
 event_log = ["mountpoint-s3-fs/event_log"]
+# Experimental: expose --rtm to route the data plane through the AWS S3 Transfer Manager.
+rtm_data_plane = [
+    "mountpoint-s3-fs/rtm_data_plane",
+    "dep:aws-config",
+    "dep:aws-sdk-s3",
+    "dep:aws-sdk-s3-transfer-manager",
+]
 # Features for choosing tests
 s3_tests = ["mountpoint-s3-fs/s3_tests"]
 fuse_tests = ["mountpoint-s3-fs/fuse_tests"]
