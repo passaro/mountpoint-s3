@@ -327,11 +327,11 @@ impl RtmReader {
 
 impl Reader for RtmReader {
     async fn read_at(&self, offset: u64, len: usize) -> Result<Segments, ReadError> {
+        // A read at or past EOF returns zero bytes, not an error, matching
+        // `PrefetchGetObject::read`. The kernel does issue a read at exactly the object size, and
+        // erroring there surfaces as EINVAL to the application.
         if offset >= self.obj.size {
-            return Err(ReadError::OutOfRange {
-                offset,
-                size: self.obj.size,
-            });
+            return Ok(Segments::new());
         }
         // Clamp rather than error: a read running past the end returns what exists, which
         // is what a filesystem read does.

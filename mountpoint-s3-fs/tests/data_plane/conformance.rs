@@ -11,7 +11,7 @@
 
 use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_fs::{
-    data::{DataPlane, ReadError, Reader, RtmConfig},
+    data::{DataPlane, Reader, RtmConfig},
     object::ObjectId,
 };
 
@@ -66,20 +66,25 @@ async fn read_past_end_is_clamped_not_an_error() {
 }
 
 #[tokio::test]
-async fn read_at_or_past_end_is_out_of_range() {
+async fn read_at_or_past_end_is_empty() {
+    // A read starting at or beyond EOF is not an error: it returns zero bytes, the same as
+    // `PrefetchGetObject::read`. The kernel issues a read at exactly the object size (e.g. on a
+    // read-ahead that lands on the end), and returning an error there surfaces as EINVAL to the
+    // application. `size` is the offset the reported bug hit.
     let size = 64 * KIB;
     let fx = Fixture::new(size, RtmConfig::default()).await;
     let reader = fx.plane.open_read(fx.spec.clone());
 
     for offset in [size, size + 1, size * 2] {
-        match reader.read_at(offset, 512).await {
-            Err(ReadError::OutOfRange { offset: o, size: s }) => {
-                assert_eq!(o, offset);
-                assert_eq!(s, size);
-            }
-            other => panic!("expected OutOfRange at {offset}, got {other:?}"),
-        }
+        let segs = reader
+            .read_at(offset, 512)
+            .await
+            .unwrap_or_else(|e| panic!("read at EOF offset {offset} should be empty, got error: {e}"));
+        assert!(segs.is_empty(), "read at EOF offset {offset} should be empty");
     }
+    // A read that starts before EOF but runs past it is still clamped (regression guard).
+    let segs = reader.read_at(size - 100, 512).await.expect("clamped read");
+    assert_eq!(segs.len(), 100);
     reader.close().await;
 }
 

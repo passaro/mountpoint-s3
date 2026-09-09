@@ -85,10 +85,6 @@ pub enum Urgency {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
-    /// The read starts at or beyond the end of the object.
-    #[error("offset {offset} is beyond object size {size}")]
-    OutOfRange { offset: u64, size: u64 },
-
     /// The object changed underneath us — `if_match` failed. Distinct from a transport
     /// error because the correct response differs: re-open at the new version rather than
     /// retry.
@@ -301,8 +297,9 @@ pub trait DataPlane: Send + Sync {
 pub trait Reader: Send + Sync {
     /// Read exactly `len` bytes at `offset`, or fewer only when the object ends first.
     ///
-    /// `Err(ReadError::OutOfRange)` if `offset` is at or past the end of the object; a `len`
-    /// that runs past the end is clamped rather than an error.
+    /// A read starting at or past the end of the object returns an empty [`Segments`] (zero bytes,
+    /// i.e. EOF), not an error; a `len` that merely runs past the end is clamped. The kernel does
+    /// issue a read at exactly the object size, so this is a normal case, not `EINVAL`.
     ///
     /// The contract matches `PrefetchGetObject::read`, so behaviour is comparable across both
     /// implementations.
