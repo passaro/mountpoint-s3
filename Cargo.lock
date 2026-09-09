@@ -3037,6 +3037,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-sdk-s3-transfer-manager",
  "built",
  "clap",
  "const_format",
