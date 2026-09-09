@@ -158,9 +158,6 @@ impl From<ReadError> for Error {
             // The object changed under us (`if_match` failed): tell the kernel to re-open, matching
             // the `PreconditionFailed` -> `ESTALE` mapping on the direct prefetch path above.
             ReadError::ObjectModified { .. } => (libc::ESTALE, "object was mutated remotely"),
-            // A read at or past EOF; `read_at` clamps a range that only runs past the end, so this
-            // is the genuinely-out-of-bounds case.
-            ReadError::OutOfRange { .. } => (libc::EINVAL, "read past end of object"),
             ReadError::OffsetMismatch { .. } | ReadError::Transfer { .. } | ReadError::UnexpectedEof { .. } => {
                 (libc::EIO, "read failed")
             }

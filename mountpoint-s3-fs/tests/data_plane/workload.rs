@@ -108,13 +108,9 @@ impl Workload {
                 let mut offset = start;
                 while bytes_read < max_bytes {
                     let at = Instant::now();
-                    let segs = match reader.read_at(offset, read_size).await {
-                        Ok(segs) => segs,
-                        // End of object: the workload is done, not failed.
-                        Err(ReadError::OutOfRange { .. }) => break,
-                        Err(e) => return Err(e),
-                    };
+                    let segs = reader.read_at(offset, read_size).await?;
                     latencies.record(at.elapsed());
+                    // Empty result means end of object: the workload is done, not failed.
                     if segs.is_empty() {
                         break;
                     }

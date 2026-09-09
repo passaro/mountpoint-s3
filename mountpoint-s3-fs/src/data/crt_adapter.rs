@@ -179,11 +179,11 @@ where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
     async fn read_at(&self, offset: u64, len: usize) -> Result<Segments, ReadError> {
+        // A read at or past EOF returns zero bytes, not an error, matching
+        // `PrefetchGetObject::read` (which this wraps): reading at exactly the object size is a
+        // normal EOF read, not `EINVAL`.
         if offset >= self.size {
-            return Err(ReadError::OutOfRange {
-                offset,
-                size: self.size,
-            });
+            return Ok(Segments::new());
         }
         let len = len.min((self.size - offset) as usize);
         if len == 0 {

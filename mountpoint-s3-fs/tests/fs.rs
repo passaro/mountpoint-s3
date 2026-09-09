@@ -116,6 +116,40 @@ async fn test_read_dir_root(prefix: &str) {
     fs.releasedir(FUSE_ROOT_INODE, dir_handle, 0).await.unwrap();
 }
 
+#[tokio::test]
+async fn test_read_at_end_of_object_is_empty() {
+    // A read starting at exactly the object size must return zero bytes (EOF), not EINVAL. The
+    // kernel does issue such a read, and returning an error surfaced to applications as
+    // "read past end of object". Exercises the real read path through S3Filesystem (default CRT
+    // data plane).
+    let prefix = Prefix::new("").expect("valid prefix");
+    let (client, fs) = make_test_filesystem("test_read_at_end", &prefix, Default::default());
+
+    let size = 15;
+    client.add_object(
+        "large",
+        MockObject::constant(0xa1, size, ETag::from_str("test_etag").unwrap()),
+    );
+
+    let lookup = fs.lookup(FUSE_ROOT_INODE, "large".as_ref()).await.unwrap();
+    let ino = lookup.attr.ino;
+    let fh = fs.open(ino, OpenFlags::empty(), 0).await.unwrap().fh;
+
+    // At EOF and past it: empty, not an error.
+    for offset in [size as i64, size as i64 + 1, size as i64 * 2] {
+        let bytes = fs
+            .read(ino, fh, offset, 4096, 0, None)
+            .await
+            .unwrap_or_else(|e| panic!("read at EOF offset {offset} should be empty, got: {e}"));
+        assert!(bytes.is_empty(), "read at EOF offset {offset} should be empty");
+    }
+    // A read that starts before EOF but overruns it is clamped to what exists.
+    let bytes = fs.read(ino, fh, 10, 4096, 0, None).await.expect("clamped read");
+    assert_eq!(bytes.len(), 5);
+
+    fs.release(ino, fh, 0, None, true).await.unwrap();
+}
+
 #[test_case(""; "unprefixed")]
 #[test_case("test_prefix/"; "prefixed")]
 #[tokio::test]
