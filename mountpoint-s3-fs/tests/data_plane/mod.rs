@@ -26,6 +26,7 @@ pub mod write;
 
 use std::sync::{Arc, Mutex};
 
+use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryConfig};
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
 use mountpoint_s3_fs::data::{ObjectSpec, RtmConfig, RtmDataPlane, WriteSpec};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -513,7 +514,11 @@ impl UploadFixture {
             config.writer.write_part_size = part_size as usize;
         }
 
-        let mut tm_config = aws_sdk_s3_transfer_manager::Config::builder().client(test_s3_client_for(&server));
+        // An explicit pool, so the writer's part buffers share the client's budget.
+        let pool = BufferPool::builder().build().expect("default memory budget resolves");
+        let mut tm_config = aws_sdk_s3_transfer_manager::Config::builder()
+            .client(test_s3_client_for(&server))
+            .memory(MemoryConfig::Explicit(pool));
         if let Some(concurrency) = concurrency {
             tm_config = tm_config.concurrency(ConcurrencyMode::Explicit(concurrency));
         }

@@ -38,6 +38,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryConfig};
+
 use crate::data::cursor::{Cursor, CursorId};
 use crate::data::writer::{RtmWriter, WriterConfig};
 use crate::data::{DataPlane, ObjectSpec, ReadError, Reader, ReaderStats, Segments, Urgency, WriteError, WriteSpec};
@@ -140,6 +142,9 @@ impl RtmConfig {
 #[derive(Debug, Clone)]
 pub struct RtmDataPlane {
     tm: aws_sdk_s3_transfer_manager::Client,
+    /// The pool upload parts are buffered in. The client's own pool when it was built with
+    /// `MemoryConfig::Explicit`, so writes and reads share one memory budget.
+    pool: BufferPool,
     config: Arc<RtmConfig>,
     /// [`RtmConfig::max_read_ahead_bytes`] resolved against the client's part size. Derived here
     /// rather than per read, since the part size cannot change for a client's lifetime.
@@ -168,6 +173,11 @@ impl RtmDataPlane {
     /// at `warn`. The assumption can be wrong in a way we cannot see: `Auto` also lets the transfer
     /// layer re-pick part sizes to align with an object's stored parts, in which case the derived
     /// ceiling is off by whatever it picked. Setting an explicit `PartSize::Target` avoids that.
+    ///
+    /// Upload parts are buffered in the client's [`BufferPool`], which is only reachable when the
+    /// caller installed it with `MemoryConfig::Explicit`. A client left on `MemoryConfig::Auto`
+    /// keeps its pool private, so the writer falls back to a second, automatically sized pool —
+    /// two budgets rather than one — and says so at `warn`.
     pub fn new(tm: aws_sdk_s3_transfer_manager::Client, config: RtmConfig) -> Self {
         let part_size = match tm.config().part_size() {
             aws_sdk_s3_transfer_manager::types::PartSize::Target(bytes) => *bytes,
@@ -187,8 +197,20 @@ impl RtmDataPlane {
             part_size, max_read_ahead_parts, "resolved read-ahead ceiling"
         );
 
+        let pool = match tm.config().memory() {
+            MemoryConfig::Explicit(pool) => pool.clone(),
+            _ => {
+                warn!(
+                    "transfer manager has no explicit memory pool; upload parts will use a \
+                     separate pool with its own budget. Set MemoryConfig::Explicit to share one."
+                );
+                BufferPool::builder().build().expect("default memory budget resolves")
+            }
+        };
+
         Self {
             tm,
+            pool,
             config: Arc::new(config),
             max_read_ahead_parts,
             next_id: Arc::new(AtomicU64::new(0)),
@@ -223,7 +245,7 @@ impl DataPlane for RtmDataPlane {
     type Writer = RtmWriter;
 
     fn open_write(&self, spec: WriteSpec) -> Result<RtmWriter, WriteError> {
-        RtmWriter::open(&self.tm, spec, &self.config.writer)
+        RtmWriter::open(&self.tm, &self.pool, spec, &self.config.writer)
     }
 
     fn open_read(&self, obj: ObjectSpec) -> RtmReader {

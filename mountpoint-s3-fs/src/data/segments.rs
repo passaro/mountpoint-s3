@@ -1,13 +1,13 @@
 //! A segmented, non-contiguous buffer.
 //!
-//! The RTM hands back [`AggregatedBytes`], which is explicitly non-contiguous, and
+//! The RTM hands back [`SegmentedBytes`], which is explicitly non-contiguous, and
 //! its escape hatch to copy-free consumption is `into_segments()`. Producing a
 //! contiguous buffer from that means a copy whenever a read spans segments — so the
 //! read API propagates the segmentation instead.
 //!
 //! Every operation here is refcount arithmetic on [`Bytes`] handles; no byte is ever copied.
 //!
-//! [`AggregatedBytes`]: https://docs.rs/aws-sdk-s3-transfer-manager
+//! [`SegmentedBytes`]: aws_sdk_s3_transfer_manager::memory::SegmentedBytes
 
 use std::collections::VecDeque;
 
@@ -251,4 +251,5 @@ mod tests {
         assert_eq!(&joined[..], &s.to_contiguous()[..]);
         // An empty run yields no slices.
         assert!(Segments::new().io_slices().is_empty());
-    }}
+    }
+}

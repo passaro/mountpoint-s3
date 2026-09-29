@@ -25,15 +25,24 @@
 //! - **Appending to an existing object is not supported.** RTM's upload builder exposes no
 //!   write offset and no `if_match`, so there is no way to express it.
 
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::sync::Mutex;
+use std::task::Poll;
+use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::io::InputStream;
+use aws_sdk_s3_transfer_manager::memory::BufferPool;
 use aws_sdk_s3_transfer_manager::operation::upload::UploadHandle;
 use tracing::{debug, trace, warn};
 
-use crate::data::part_channel::{self, Closed, PartSink};
+use crate::data::part_channel::{self, PartSink, SinkError};
 use crate::data::priority::PriorityTable;
 use crate::data::{Urgency, WriteError, WriteOutcome, WriteSpec, Writer, WriterStats};
+
+/// How often a writer stalled on the sink checks whether the upload has ended. See
+/// [`until_terminated`].
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Default part size the sink cuts to when a caller does not set one.
 const DEFAULT_WRITE_PART_SIZE: usize = 8 * 1024 * 1024;
@@ -102,6 +111,7 @@ impl RtmWriter {
     /// requested (RTM's streaming MPU has no write offset or `if_match`).
     pub fn open(
         tm: &aws_sdk_s3_transfer_manager::Client,
+        pool: &BufferPool,
         spec: WriteSpec,
         config: &WriterConfig,
     ) -> Result<Self, WriteError> {
@@ -109,7 +119,7 @@ impl RtmWriter {
             return Err(WriteError::IncrementalUnsupported);
         }
         let part_size = config.write_part_size.max(MIN_WRITE_PART_SIZE);
-        let (sink, source) = part_channel::channel(part_size);
+        let (sink, source) = part_channel::channel(pool.clone(), part_size);
         // No size hint is set on the source, so RTM reads it to end-of-stream rather than
         // dispatching a part budget computed from a declared length. The sink cuts parts at
         // `part_size` — RTM uploads each as-is — and hands over one at a time, blocking the writer
@@ -182,7 +192,10 @@ impl Writer for RtmWriter {
             return Err(WriteError::NotInProgress);
         };
 
-        match sink.write(data).await {
+        let Some(result) = until_terminated(self.handle.as_ref(), sink.write(data)).await else {
+            return Err(self.diagnose_closed().await);
+        };
+        match result {
             Ok(stalls) => {
                 self.next_offset = end;
                 let mut stats = self.stats.lock().expect("writer stats lock poisoned");
@@ -191,7 +204,10 @@ impl Writer for RtmWriter {
                 Ok(data.len())
             }
             // The transfer ended. Report why, not just that the channel closed.
-            Err(Closed) => Err(self.diagnose_closed().await),
+            Err(SinkError::Closed) => Err(self.diagnose_closed().await),
+            // Nothing was lost: the bytes that failed to buffer were not accepted, and the stream
+            // stays open, so the caller may retry or abort.
+            Err(e @ SinkError::Memory(_)) => Err(WriteError::Transfer(Box::new(e))),
         }
     }
 
@@ -202,9 +218,9 @@ impl Writer for RtmWriter {
         let Some(mut sink) = self.sink.take() else {
             return Err(WriteError::NotInProgress);
         };
-        let finished = sink.finish().await;
+        let finished = until_terminated(self.handle.as_ref(), sink.finish()).await;
         drop(sink);
-        if finished.is_err() {
+        if !matches!(finished, Some(Ok(()))) {
             return Err(self.diagnose_closed().await);
         }
 
@@ -251,6 +267,34 @@ impl Writer for RtmWriter {
     fn stats(&self) -> WriterStats {
         *self.stats.lock().expect("writer stats lock poisoned")
     }
+}
+
+/// Run a sink operation, giving up if the upload ends while it is stalled.
+///
+/// Returns `None` if the upload reached a terminal state first. A failed transfer does not drop its
+/// part stream — the [`UploadHandle`] keeps it alive until joined or dropped — so the sink's own
+/// `Closed` signal never fires and a writer blocked on a handoff would wait forever. The handle
+/// offers no notification short of the consuming `join()`, so its status is polled instead, and
+/// only once the operation is actually pending: a write that does not stall pays nothing.
+///
+/// The operation is polled first, so a sink that completes on the same wake-up wins.
+async fn until_terminated<T>(handle: Option<&UploadHandle>, op: impl Future<Output = T>) -> Option<T> {
+    let mut op = pin!(op);
+    let mut watch = pin!(async {
+        loop {
+            if handle.is_none_or(|handle| handle.status().is_terminal()) {
+                return;
+            }
+            async_io::Timer::after(STATUS_POLL_INTERVAL).await;
+        }
+    });
+    poll_fn(|cx| {
+        if let Poll::Ready(output) = op.as_mut().poll(cx) {
+            return Poll::Ready(Some(output));
+        }
+        watch.as_mut().poll(cx).map(|()| None)
+    })
+    .await
 }
 
 impl Drop for RtmWriter {

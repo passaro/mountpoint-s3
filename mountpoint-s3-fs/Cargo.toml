@@ -15,9 +15,12 @@ mountpoint-s3-client = { workspace = true }
 # mountpoint-s3 binary does not enable the feature, so it stays out of release builds.
 #
 # Pinned to an exact upstream commit rather than a crates.io version. This rev is `main`
-# at f4c8f46, which adds unknown-length streaming uploads (PR #164): the write path
-# relies on it. Swap for a release tag once one lands past #164.
-aws-sdk-s3-transfer-manager = { git = "https://github.com/awslabs/aws-s3-transfer-manager-rs.git", rev = "f4c8f46", optional = true }
+# at ccc8d95, the shared buffer pool (PR #187), which the write path buffers parts in. It
+# also relies on unknown-length streaming uploads (PR #164). Swap for a release tag once
+# one lands past #187.
+aws-sdk-s3-transfer-manager = { git = "https://github.com/awslabs/aws-s3-transfer-manager-rs.git", rev = "ccc8d95", optional = true }
+# Runtime-agnostic timer the RTM writer uses to notice a failed upload while stalled on a handoff.
+async-io = { version = "2.6.0", optional = true }
 
 anyhow = { version = "1.0.103", features = ["backtrace"] }
 async-channel = "2.5.0"
@@ -101,7 +104,7 @@ wiremock = "0.6.5"
 block_size = []
 event_log = []
 # Experimental RTM-backed data plane (mountpoint-s3-fs::data). Example/test use only.
-rtm_data_plane = ["aws-sdk-s3-transfer-manager"]
+rtm_data_plane = ["aws-sdk-s3-transfer-manager", "async-io"]
 # Use alternative configuration for jemalloc.
 jemalloc_conf = []
 manifest = ["csv", "rusqlite"]

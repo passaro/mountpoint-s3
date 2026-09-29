@@ -276,7 +276,8 @@ fn build_s3(global: &GlobalConfig) -> Result<S3Resources, ExecutionError> {
 /// Build the RTM-backed data plane.
 #[cfg(feature = "rtm_data_plane")]
 fn build_rtm_plane(global: &GlobalConfig) -> Result<RtmBenchPlane, ExecutionError> {
-    use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, TargetThroughput};
+    use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryBudgetConfig, MemoryConfig};
+    use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
     use mountpoint_s3_fs::data::{RtmConfig, RtmDataPlane};
 
     let read_part_size = read_part_size(global);
@@ -303,10 +304,15 @@ fn build_rtm_plane(global: &GlobalConfig) -> Result<RtmBenchPlane, ExecutionErro
             TargetThroughput::new_gigabits_per_sec(gbps as u64),
         ));
     }
-    // Apply `memory_target` to the transfer manager.
+    // One pool, sized by `memory_target`, shared by the transfer manager and the data plane's writer.
+    let mut pool_builder = BufferPool::builder();
     if let Some(mib) = global.memory_target {
-        tm_builder = tm_builder.memory_budget(MemoryBudgetConfig::Limit(mib * 1024 * 1024));
+        pool_builder = pool_builder.memory_budget(MemoryBudgetConfig::Limit(mib * 1024 * 1024));
     }
+    let pool = pool_builder
+        .build()
+        .map_err(|e| ExecutionError::ResourceInitError(format!("invalid memory_target: {e}")))?;
+    tm_builder = tm_builder.memory(MemoryConfig::Explicit(pool));
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_builder.build());
     let mut config = RtmConfig::default();
     // The RTM writer cuts parts at its own `write_part_size`, independent of the read part size above.

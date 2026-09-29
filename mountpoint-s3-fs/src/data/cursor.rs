@@ -522,7 +522,7 @@ impl Cursor {
                             actual: start,
                         });
                     }
-                    let mut segs: Segments = chunk.data.into_segments().collect();
+                    let mut segs: Segments = chunk.data.into_segments().into_iter().collect();
                     let n = segs.len() as u64;
                     self.bytes_fetched += n;
                     self.next_offset += n;

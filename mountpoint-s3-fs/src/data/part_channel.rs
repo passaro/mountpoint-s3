@@ -14,6 +14,15 @@
 //! concurrently on its own runtime while polling for the next. The writer simply never runs more
 //! than one part ahead of what RTM has taken.
 //!
+//! # Part buffers come from the transfer manager's pool
+//!
+//! Each part is written into storage acquired from the RTM [`BufferPool`] — the same pool the
+//! transfer manager's downloads draw from, when the client was built with
+//! `MemoryConfig::Explicit` — and handed to RTM as [`SegmentedBytes`] without a copy. The sink
+//! reserves a whole part before accepting its first byte, so a writer also waits when the shared
+//! memory budget is exhausted; that wait counts as a stall too. The part stays charged to the pool
+//! until RTM has uploaded and dropped it.
+//!
 //! # Parts are cut on the push side
 //!
 //! Because the object length is unknown, RTM (its unknown-length streaming support, PR #164) reads
@@ -35,7 +44,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use aws_sdk_s3_transfer_manager::io::{PartData, PartStream, SizeHint, StreamContext};
-use bytes::{Bytes, BytesMut};
+use aws_sdk_s3_transfer_manager::memory::{BufferPool, PooledBufMut, SegmentedBytes};
+use bytes::BufMut;
 use mountpoint_s3_client::checksums::crc64nvme::Crc64nvmeHasher;
 use mountpoint_s3_client::checksums::crc64nvme_to_base64;
 
@@ -43,6 +53,23 @@ use mountpoint_s3_client::checksums::crc64nvme_to_base64;
 /// upload handle's to report, not the channel's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Closed;
+
+/// Why the sink could not accept bytes.
+#[derive(Debug, thiserror::Error)]
+pub enum SinkError {
+    /// The transfer dropped the stream. See [`Closed`].
+    #[error("part channel closed")]
+    Closed,
+    /// The pool could not supply storage for a part, e.g. a part larger than the pool's capacity.
+    #[error("could not acquire part buffer: {0}")]
+    Memory(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<Closed> for SinkError {
+    fn from(_: Closed) -> Self {
+        SinkError::Closed
+    }
+}
 
 /// The one-slot handoff shared by [`PartSink`] and [`PartSource`].
 #[derive(Debug)]
@@ -53,7 +80,7 @@ struct Shared {
 #[derive(Debug)]
 struct State {
     /// The single full (or final) part awaiting pickup by RTM. `None` between handoffs.
-    ready: Option<Bytes>,
+    ready: Option<SegmentedBytes>,
     /// The writer signalled end-of-stream (`finish`, or dropped).
     closed: bool,
     /// The transfer dropped the source — it finished or failed. A blocked writer wakes as `Closed`.
@@ -68,8 +95,9 @@ struct State {
     next_part_number: u64,
 }
 
-/// Create a connected sink and source that hand off whole parts of `part_size` bytes.
-pub fn channel(part_size: usize) -> (PartSink, PartSource) {
+/// Create a connected sink and source that hand off whole parts of `part_size` bytes, each held
+/// in storage from `pool`.
+pub fn channel(pool: BufferPool, part_size: usize) -> (PartSink, PartSource) {
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
             ready: None,
@@ -84,7 +112,8 @@ pub fn channel(part_size: usize) -> (PartSink, PartSource) {
     (
         PartSink {
             shared: shared.clone(),
-            current: BytesMut::new(),
+            pool,
+            current: None,
             part_size: part_size.max(1),
             hasher: Crc64nvmeHasher::new(),
         },
@@ -95,8 +124,10 @@ pub fn channel(part_size: usize) -> (PartSink, PartSource) {
 /// The push end, written to by [`Writer::write_at`](crate::data::Writer::write_at).
 pub struct PartSink {
     shared: Arc<Shared>,
-    /// Bytes accumulated toward the current part; never grows past `part_size`.
-    current: BytesMut,
+    pool: BufferPool,
+    /// Bytes accumulated toward the current part; never grows past `part_size`. `None` until the
+    /// first byte of a part arrives, so an idle writer holds no pool memory.
+    current: Option<PooledBufMut>,
     part_size: usize,
     /// Running full-object CRC64-NVME, updated as bytes are accepted (writes are append-only, so the
     /// order is the object's order). Finalised in [`finish`](Self::finish).
@@ -107,7 +138,7 @@ impl std::fmt::Debug for PartSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PartSink")
             .field("part_size", &self.part_size)
-            .field("buffered", &self.current.len())
+            .field("buffered", &self.current.as_ref().map_or(0, PooledBufMut::len))
             .finish_non_exhaustive()
     }
 }
@@ -115,33 +146,59 @@ impl std::fmt::Debug for PartSink {
 impl PartSink {
     /// Accept `data`, cutting and handing off whole parts as they fill.
     ///
-    /// Returns the number of handoffs that had to wait for RTM to take the previous part — the
-    /// backpressure signal reported as
+    /// Returns the number of times the write had to wait — for RTM to take the previous part, or
+    /// for the pool to admit the next one. This is the backpressure signal reported as
     /// [`WriterStats::write_stalls`](crate::data::WriterStats::write_stalls). Since at most one part
     /// is buffered, filling a part always means awaiting RTM before continuing.
-    pub async fn write(&mut self, data: &[u8]) -> Result<u64, Closed> {
+    pub async fn write(&mut self, data: &[u8]) -> Result<u64, SinkError> {
         let mut stalls = 0;
         let mut rest = data;
         while !rest.is_empty() {
-            let space = self.part_size - self.current.len();
+            let current = match &mut self.current {
+                Some(current) => current,
+                None => {
+                    let (buf, waited) = Self::acquire(&self.pool, self.part_size).await?;
+                    stalls += waited;
+                    self.current.insert(buf)
+                }
+            };
+            let space = self.part_size - current.len();
             let take = space.min(rest.len());
             self.hasher.update(&rest[..take]);
-            self.current.extend_from_slice(&rest[..take]);
+            current.put_slice(&rest[..take]);
             rest = &rest[take..];
 
-            if self.current.len() == self.part_size {
-                let part = self.current.split().freeze();
+            if current.len() == self.part_size {
+                let part = self.current.take().expect("part buffer present").freeze();
                 stalls += Self::handoff(&self.shared, part).await?;
             }
         }
         Ok(stalls)
     }
 
+    /// Acquire storage for one whole part from the pool, waiting for admission if the budget is
+    /// exhausted. Returns 1 alongside the buffer if it had to wait, else 0.
+    ///
+    /// The reservation is closed straight after acquiring: the buffer keeps its memory charged
+    /// until the frozen part is dropped, and the part never grows past what was acquired.
+    async fn acquire(pool: &BufferPool, part_size: usize) -> Result<(PooledBufMut, u64), SinkError> {
+        let memory = |e| SinkError::Memory(Box::new(e));
+        let (reservation, waited) = match pool.try_reserve(part_size).map_err(memory)? {
+            Some(reservation) => (reservation, 0),
+            None => (pool.reserve(part_size).await.map_err(memory)?, 1),
+        };
+        let buf = pool
+            .acquire(&reservation, part_size)
+            .map_err(|e| SinkError::Memory(Box::new(e)))?;
+        reservation.close_acquisition();
+        Ok((buf, waited))
+    }
+
     /// Hand one full part to the source and wait until RTM has taken it.
     ///
     /// Two phases, both waking/parking against the shared slot: place the part once the slot is free,
     /// then wait until it is taken. Returns 1 if either phase had to wait, else 0.
-    async fn handoff(shared: &Arc<Shared>, part: Bytes) -> Result<u64, Closed> {
+    async fn handoff(shared: &Arc<Shared>, part: SegmentedBytes) -> Result<u64, Closed> {
         let mut waited = false;
 
         // Phase 1: wait for the slot to be free, then place the part and wake RTM.
@@ -191,9 +248,8 @@ impl PartSink {
     /// stream yields `None`. Finalises the full-object checksum before closing, so it is available by
     /// the time RTM reaches end-of-stream and asks for it.
     pub async fn finish(&mut self) -> Result<(), Closed> {
-        if !self.current.is_empty() {
-            let part = self.current.split().freeze();
-            Self::handoff(&self.shared, part).await?;
+        if let Some(current) = self.current.take().filter(|current| !current.is_empty()) {
+            Self::handoff(&self.shared, current.freeze()).await?;
         }
         let checksum = crc64nvme_to_base64(&self.hasher.clone().finalize());
         let mut st = self.shared.state.lock().expect("part channel lock poisoned");
@@ -247,7 +303,7 @@ impl PartStream for PartSource {
             if let Some(w) = st.sink_waker.take() {
                 w.wake();
             }
-            return Poll::Ready(Some(Ok(PartData::new(part_number, part))));
+            return Poll::Ready(Some(Ok(PartData::from_segmented(part_number, part))));
         }
         if st.closed {
             return Poll::Ready(None);
@@ -288,7 +344,7 @@ impl Drop for PartSource {
 impl PartSource {
     /// Take the ready part, if any, mimicking what `poll_part` does — for tests, which cannot
     /// construct a `StreamContext` to drive `poll_part` directly.
-    fn take_ready(&self) -> Option<Bytes> {
+    fn take_ready(&self) -> Option<bytes::Bytes> {
         let mut st = self.shared.state.lock().expect("part channel lock poisoned");
         let part = st.ready.take();
         if part.is_some() {
@@ -297,7 +353,7 @@ impl PartSource {
                 w.wake();
             }
         }
-        part
+        part.map(SegmentedBytes::into_contiguous)
     }
 
     fn is_closed(&self) -> bool {
@@ -308,12 +364,24 @@ impl PartSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_s3_transfer_manager::memory::MemoryBudgetConfig;
     use futures::executor::block_on;
     use futures::future::poll_immediate;
 
+    fn pool(limit: usize) -> BufferPool {
+        BufferPool::builder()
+            .memory_budget(MemoryBudgetConfig::Limit(limit))
+            .build()
+            .expect("valid pool")
+    }
+
+    fn test_channel(part_size: usize) -> (PartSink, PartSource) {
+        channel(pool(64 * 1024 * 1024), part_size)
+    }
+
     #[test]
     fn a_full_part_blocks_the_writer_until_taken() {
-        let (mut sink, source) = channel(4);
+        let (mut sink, source) = test_channel(4);
 
         // Two parts' worth in one write. The first part fills and is handed off; the write cannot
         // finish until RTM takes it.
@@ -337,7 +405,7 @@ mod tests {
 
     #[test]
     fn finish_flushes_the_final_short_part_and_closes() {
-        let (mut sink, source) = channel(4);
+        let (mut sink, source) = test_channel(4);
 
         // A sub-part write buffers but hands off nothing yet.
         assert_eq!(block_on(sink.write(&[7u8; 2])).expect("write"), 0);
@@ -359,7 +427,7 @@ mod tests {
 
     #[test]
     fn empty_object_finishes_without_a_part() {
-        let (mut sink, source) = channel(4);
+        let (mut sink, source) = test_channel(4);
         block_on(sink.finish()).expect("finish");
         assert!(source.is_closed());
         assert!(source.take_ready().is_none(), "no part for an empty object");
@@ -368,30 +436,66 @@ mod tests {
 
     #[test]
     fn dropping_the_source_wakes_a_blocked_writer_as_closed() {
-        let (mut sink, source) = channel(4);
+        let (mut sink, source) = test_channel(4);
 
         let mut write = Box::pin(sink.write(&[1u8; 8]));
         assert!(block_on(poll_immediate(&mut write)).is_none());
 
         drop(source);
-        assert_eq!(
-            block_on(write),
-            Err(Closed),
-            "a blocked writer must learn the transfer is gone"
-        );
+        assert!(matches!(block_on(write), Err(SinkError::Closed)));
     }
 
     #[test]
     fn dropping_the_sink_closes_the_stream() {
-        let (sink, source) = channel(4);
+        let (sink, source) = test_channel(4);
         drop(sink);
         assert!(source.is_closed(), "a dropped writer must not leave RTM waiting");
     }
 
     #[test]
     fn write_after_the_source_is_gone_reports_closed() {
-        let (mut sink, source) = channel(4);
+        let (mut sink, source) = test_channel(4);
         drop(source);
-        assert_eq!(block_on(sink.write(&[1u8; 4])), Err(Closed));
+        assert!(matches!(block_on(sink.write(&[1u8; 4])), Err(SinkError::Closed)));
+    }
+
+    #[test]
+    fn a_part_is_charged_to_the_pool_until_dropped() {
+        let pool = pool(64 * 1024 * 1024);
+        let (mut sink, source) = channel(pool.clone(), 4);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            0,
+            "no memory before the first byte"
+        );
+
+        let mut write = Box::pin(sink.write(&[1u8; 4]));
+        assert!(block_on(poll_immediate(&mut write)).is_none());
+        assert!(
+            pool.metrics().charged_capacity_bytes() > 0,
+            "the buffered part is charged"
+        );
+
+        let part = source.shared.state.lock().unwrap().ready.take().expect("part ready");
+        block_on(write).expect("write completes");
+        assert!(
+            pool.metrics().charged_capacity_bytes() > 0,
+            "still charged while RTM holds it"
+        );
+
+        drop(part);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            0,
+            "released once the part is dropped"
+        );
+    }
+
+    #[test]
+    fn a_part_larger_than_the_pool_fails() {
+        let pool = pool(4 * 1024 * 1024);
+        let part_size = usize::try_from(pool.metrics().configured_capacity_bytes()).unwrap() + 1;
+        let (mut sink, _source) = channel(pool, part_size);
+        assert!(matches!(block_on(sink.write(&[1u8])), Err(SinkError::Memory(_))));
     }
 }
