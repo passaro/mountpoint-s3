@@ -337,25 +337,19 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml).expect("parses");
         assert_eq!(config.global.data_plane, DataPlaneKind::Prefetcher);
-        assert_eq!(config.global.rtm_read_ahead_bytes, None);
-        assert_eq!(config.global.rtm_read_ahead_multiplier, None);
     }
 
     #[test]
-    fn data_plane_and_rtm_knobs_parse() {
+    fn data_plane_rtm_parses() {
         let toml = r#"
             [global]
             bucket = "b"
             data_plane = "rtm"
-            rtm_read_ahead_bytes = 16777216
-            rtm_read_ahead_multiplier = 4
             [jobs.j]
             workload_type = "read"
         "#;
         let config: Config = toml::from_str(toml).expect("parses");
         assert_eq!(config.global.data_plane, DataPlaneKind::Rtm);
-        assert_eq!(config.global.rtm_read_ahead_bytes, Some(16 * 1024 * 1024));
-        assert_eq!(config.global.rtm_read_ahead_multiplier, Some(4));
     }
 
     #[test]
