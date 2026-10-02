@@ -8,8 +8,8 @@ use mountpoint_s3_client::config::{Allocator, EndpointConfig, S3ClientConfig, Ur
 use mountpoint_s3_client::types::HeadObjectParams;
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
 use mountpoint_s3_fs::data::{CrtDataPlane, DataPlane, ObjectSpec, Reader, WriteError, WriteSpec, Writer};
-use mountpoint_s3_fs::memory::effective_total_memory;
 use mountpoint_s3_fs::memory::{CandidateSize, PagedPool};
+use mountpoint_s3_fs::memory::{data_buffer_budget_for, effective_total_memory};
 use mountpoint_s3_fs::prefetch::{Prefetcher, PrefetcherConfig};
 use mountpoint_s3_fs::upload::{Uploader, UploaderConfig};
 use mountpoint_s3_fs::{Runtime, ServerSideEncryption};
@@ -304,10 +304,13 @@ fn build_rtm_plane(global: &GlobalConfig) -> Result<RtmBenchPlane, ExecutionErro
             TargetThroughput::new_gigabits_per_sec(gbps as u64),
         ));
     }
-    // One pool, sized by `memory_target`, shared by the transfer manager and the data plane's writer.
+    // One pool, shared by the transfer manager and the data plane's writer. Sized like the CRT arm's
+    // buffers: `MemoryLimiter` holds back part of `memory_target` for non-buffer overhead, and
+    // `data_buffer_budget_for` is what is left, so the same target bounds both arms' process memory.
     let mut pool_builder = BufferPool::builder();
     if let Some(mib) = global.memory_target {
-        pool_builder = pool_builder.memory_budget(MemoryBudgetConfig::Limit(mib * 1024 * 1024));
+        let budget = data_buffer_budget_for(mib * 1024 * 1024);
+        pool_builder = pool_builder.memory_budget(MemoryBudgetConfig::Limit(budget));
     }
     let pool = pool_builder
         .build()
