@@ -486,9 +486,11 @@ impl MockClient {
                 }
 
                 let current_algorithms = object.checksum.algorithms();
+                // An append without a checksum uses S3's default (CRC64NVME), so it is only
+                // accepted on objects with that checksum (or none); otherwise the algorithm must match.
                 let checksum_matches = match &params.checksum {
                     Some(checksum) => current_algorithms.contains(&checksum.checksum_algorithm()),
-                    None => current_algorithms.is_empty(),
+                    None => current_algorithms.is_empty() || current_algorithms == [ChecksumAlgorithm::Crc64nvme],
                 };
                 if !checksum_matches {
                     return Err(ObjectClientError::ServiceError(PutObjectError::InvalidChecksumType));
@@ -728,18 +730,23 @@ fn compute_checksum(content: &[u8], algorithms: &[ChecksumAlgorithm]) -> Checksu
 }
 
 /// Validate data against the [UploadChecksum] and return the [Checksum] to be stored.
+///
+/// An upload without a checksum stores the full-object CRC64NVME checksum S3 computes by default.
 fn validate_checksum(
     contents: &[u8],
     upload_checksum: Option<&UploadChecksum>,
 ) -> ObjectClientResult<Checksum, PutObjectError, MockClientError> {
-    let algorithm = upload_checksum.map(|c| c.checksum_algorithm());
-    let content_checksum = compute_checksum(contents, algorithm.as_slice());
-    let provided_checksum = upload_checksum.cloned().into();
+    let Some(upload_checksum) = upload_checksum else {
+        return Ok(compute_checksum(contents, &[ChecksumAlgorithm::Crc64nvme]));
+    };
+    let content_checksum = compute_checksum(contents, &[upload_checksum.checksum_algorithm()]);
+    let provided_checksum = Some(upload_checksum.clone()).into();
     if provided_checksum != content_checksum {
         return Err(ObjectClientError::ServiceError(PutObjectError::BadChecksum));
     }
     Ok(provided_checksum)
 }
+
 #[derive(Clone, Debug)]
 pub struct MockBackpressureHandle {
     read_window_end_offset: Arc<AtomicU64>,
@@ -783,6 +790,10 @@ pub struct MockGetObjectResponse {
     object: MockObject,
     next_offset: u64,
     length: usize,
+    /// Whether the request enabled checksum mode.
+    requested_checksums: bool,
+    /// Whether the request covers the whole object (no range, or a range spanning all of it).
+    whole_object: bool,
     part_size: usize,
     backpressure_handle: Option<MockBackpressureHandle>,
 }
@@ -816,7 +827,16 @@ impl GetObjectResponse for MockGetObjectResponse {
     }
 
     fn get_object_checksum(&self) -> Result<Checksum, ObjectChecksumError> {
-        Ok(self.object.checksum.clone())
+        // Like S3 (and the CRT client): checksums are only returned with checksum mode enabled,
+        // and only for a GET of the whole object, not for a range of it.
+        if !self.requested_checksums {
+            return Err(ObjectChecksumError::DidNotRequestChecksums);
+        }
+        if self.whole_object {
+            Ok(self.object.checksum.clone())
+        } else {
+            Ok(Checksum::empty())
+        }
     }
 }
 
@@ -996,6 +1016,8 @@ impl ObjectClient for MockClient {
                 object: object.clone(),
                 next_offset,
                 length,
+                requested_checksums: params.checksum_mode == Some(ChecksumMode::Enabled),
+                whole_object: next_offset == 0 && length == object.len(),
                 part_size: self.config.part_size,
                 backpressure_handle,
             })
@@ -1313,6 +1335,9 @@ impl MockPutObjectRequest {
                 });
             }
             PutObjectTrailingChecksums::Disabled | PutObjectTrailingChecksums::ReviewOnly(_) => {
+                // Without additional checksums, S3 computes a full-object CRC64NVME checksum.
+                let checksum = compute_checksum(&object.read(0, object.len()), &[ChecksumAlgorithm::Crc64nvme]);
+                object.set_checksum(checksum);
                 object.parts = Some(MockObjectParts::Count(parts.len()));
             }
         }
@@ -2218,6 +2243,10 @@ mod tests {
                 .map(|checksum| checksum.expect("checksum must be set when using trailing checksums"));
             let obj_checksum = compute_crc32c_of_crc32c_checksums(part_checksums);
             expected_obj_checksum.checksum_crc32c = Some(obj_checksum);
+        } else if !stored_on_object {
+            // Without additional checksums, S3 stores its default full-object CRC64NVME checksum.
+            expected_obj_checksum.checksum_crc64nvme =
+                Some(crc64nvme_to_base64(&crc64nvme::checksum(&obj.read(0, obj.len()))));
         }
 
         assert_eq!(
@@ -2753,5 +2782,96 @@ mod tests {
             err,
             ObjectClientError::ServiceError(PutObjectError::InvalidChecksumType)
         ));
+    }
+
+    #[tokio::test]
+    async fn put_without_checksum_stores_default_crc64nvme() {
+        let client = MockClient::config().bucket("test_bucket").part_size(1024).build();
+        let content = vec![7u8; 100];
+        client
+            .put_object_single("test_bucket", "key", &PutObjectSingleParams::new(), content.clone())
+            .await
+            .unwrap();
+        let head = client
+            .head_object(
+                "test_bucket",
+                "key",
+                &HeadObjectParams::new().checksum_mode(Some(ChecksumMode::Enabled)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.checksum.algorithms(), [ChecksumAlgorithm::Crc64nvme]);
+        assert_eq!(
+            head.checksum.checksum_crc64nvme,
+            Some(crc64nvme_to_base64(&crc64nvme::checksum(&content)))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_checksum_requires_checksum_mode_and_whole_object() {
+        let client = MockClient::config().bucket("test_bucket").part_size(1024).build();
+        let object = MockObject::from([1u8; 64]).with_computed_checksums(&[ChecksumAlgorithm::Crc32c]);
+        client.add_object("key", object.clone());
+
+        let get = client
+            .get_object("test_bucket", "key", &GetObjectParams::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            get.get_object_checksum(),
+            Err(ObjectChecksumError::DidNotRequestChecksums)
+        ));
+
+        let enabled = GetObjectParams::new().checksum_mode(Some(ChecksumMode::Enabled));
+        let get = client.get_object("test_bucket", "key", &enabled).await.unwrap();
+        assert_eq!(get.get_object_checksum().unwrap(), object.checksum);
+
+        let get = client
+            .get_object("test_bucket", "key", &enabled.clone().range(Some(0..64)))
+            .await
+            .unwrap();
+        assert_eq!(
+            get.get_object_checksum().unwrap(),
+            object.checksum,
+            "range covering the object"
+        );
+
+        let get = client
+            .get_object("test_bucket", "key", &enabled.range(Some(0..32)))
+            .await
+            .unwrap();
+        assert_eq!(get.get_object_checksum().unwrap(), Checksum::empty(), "partial range");
+    }
+
+    #[tokio::test]
+    async fn append_without_checksum_to_default_checksum_object() {
+        let client = MockClient::config().bucket("test_bucket").part_size(1024).build();
+        client
+            .put_object_single("test_bucket", "key", &PutObjectSingleParams::new(), vec![1u8; 10])
+            .await
+            .unwrap();
+        client
+            .put_object_single(
+                "test_bucket",
+                "key",
+                &PutObjectSingleParams::new_for_append(10),
+                vec![2u8; 10],
+            )
+            .await
+            .expect("append without checksum to a default-checksum object should succeed");
+        let head = client
+            .head_object(
+                "test_bucket",
+                "key",
+                &HeadObjectParams::new().checksum_mode(Some(ChecksumMode::Enabled)),
+            )
+            .await
+            .unwrap();
+        let mut content = vec![1u8; 10];
+        content.extend_from_slice(&[2u8; 10]);
+        assert_eq!(
+            head.checksum.checksum_crc64nvme,
+            Some(crc64nvme_to_base64(&crc64nvme::checksum(&content)))
+        );
     }
 }
